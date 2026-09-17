@@ -1,0 +1,24 @@
+:root {
+  /* EVOLVE 设计令牌 */
+  --bg-base: #04050A;
+  --bg-surface: #0B0D16;
+  --bg-card: #0E1120;
+  --bg-elevated: #131729;
+  --border: #1C2233;
+  --border-strong: #2A3348;
+  --primary: #22D3EE;
+  --primary-10: rgba(34, 211, 238, 0.10);
+  --primary-40: rgba(34, 211, 238, 0.40);
+  --accent: #E879F9;
+  --warning: #FFB020;
+  --up: #FF4D6D;
+  --down: #00D68F;
+  --text-main: #E8EDF5;
+  --text-sub: #97A0B5;
+  --text-weak: #5C6478;
+  --signal: #FF8700;
+
+  --font-ui: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  --font-cn: 'Sarasa Gothic SC', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+}

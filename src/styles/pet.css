@@ -1,0 +1,470 @@
+/**
+ * EVOLVE 桌宠 · 样式
+ *
+ * ── 透明窗口这条要求决定了整个文件的写法 ──────────────────────────────
+ * 桌宠窗口是 `transparent: true` + `frame: false`（见 src/pet/petWindow.ts）。
+ * 但全局 `body` 有自己的底色，**不把它抹掉，透明窗就会变成一块黑方块** ——
+ * 而这件事在浏览器里预览是看不出来的（浏览器里压根不透明），
+ * 只有真起 Electron 才会暴露。所以下面那段 `html.pet-standalone` 是必需的，
+ * 不是可选的美化。
+ *
+ * 同理，桌宠页里所有"看着像卡片"的容器都必须是**半透明玻璃**：
+ * 一旦给它们不透明底色，头像周围就出现一个方形色块，扣图感全没了。
+ *
+ * ── 时间轴 `--ap` / `--lid` / `--breath` / `--bob` ────────────────────
+ * 这四个变量由 `PetAvatar` 的 rAF 循环每帧写一次（见 src/pet/avatarMotion.ts）。
+ * CSS 里**不允许对它们做 transition** —— 帧已经是连续的了，
+ * 再加一层缓动会让嘴在快速词边界之间"糊"起来，看起来像在抽搐。
+ */
+
+/* ═══════════ 透明窗口：只在 ?pet=1 时生效 ═══════════ */
+html.pet-standalone,
+html.pet-standalone body,
+html.pet-standalone #root {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+html.pet-standalone {
+  /* 桌宠是悬浮窗，没有页面滚动这回事 */
+  height: 100%;
+}
+
+/* ═══════════ 舞台 ═══════════ */
+.pet-stage {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  gap: 8px;
+  padding: 10px;
+  box-sizing: border-box;
+  font-family: var(--font-ui);
+  color: var(--text-main);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 页面模式（在侧边栏里看）需要一点内边距与底色，窗内模式不需要 */
+.pet-page-shell {
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-base);
+}
+
+/* ═══════════ 头像 ═══════════ */
+.pet-avatar-root {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 拖动热区：只有头像可以拖，字幕区要能选中文字 */
+  cursor: grab;
+}
+.pet-avatar-root:active {
+  cursor: grabbing;
+}
+
+/* 尺寸档位。
+   ★ 这几个像素值必须与 `src/pet/avatarSize.ts` 的 `PET_AVATAR_SIZES` 一致。
+   两边各写一份是有意的（CSS 读不到 TS 常量），但它必然会漂移 ——
+   所以 `pet-smoke` 里有一条断言直接对读这两个来源，
+   改了一边不改另一边会当场报红。 */
+.pet-avatar-root[data-size='sm'] { --avatar-size: 112px; }
+.pet-avatar-root[data-size='md'] { --avatar-size: 152px; }
+.pet-avatar-root[data-size='lg'] { --avatar-size: 208px; }
+/* 特大档：把早期"头像铺满窗口"的观感请回来（当时直径等于容器剩余高度）。
+   仍然有界 —— 上界由 PET_PHOTO_SIZE / 2 = 320px 决定，见 avatarSize.ts。 */
+.pet-avatar-root[data-size='xl'] { --avatar-size: 280px; }
+
+/* 呼吸相位驱动的极轻微缩放。幅度必须小（<2%），大了像在坐船 */
+.pet-breathe {
+  transform: scale(calc(1 + var(--breath, 0.5) * 0.015));
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pet-photo-wrap {
+  position: relative;
+  /* 高度来自档位，**不再**等于容器剩余高度。
+     原来是 `height: 100%`，于是头像直径 = 剩余空间 —— 控制台里超过 400px，
+     360×540 的悬浮窗里接近 280px，把字幕区挤到只剩两三行。
+     而字幕才是这个窗口的主体：用户要的是"它说了什么"，不是"它长什么样"。
+     `max-height` 兜住矮窗口（窗口被拖到很小时头像跟着缩，而不是溢出被裁）。
+     档位定义见 src/pet/avatarSize.ts。 */
+  height: var(--avatar-size, 152px);
+  max-height: 100%;
+  aspect-ratio: 1 / 1;
+  max-width: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  /* 说话时的头部起伏。用 translate 而不是改布局，避免每帧触发布局重算 */
+  transform: translateY(calc(var(--bob, 0px) * -1));
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+
+.pet-photo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* 轻微提饱和：真人照片缩小到桌宠尺寸后普遍显得发灰 */
+  filter: saturate(1.06) contrast(1.03);
+  pointer-events: none;
+}
+
+/* 动图 / 视频不叠器官层（见 PetAvatar.tsx 的 `overlay`）。
+   同时也不提饱和 —— 那套滤镜是按"照片缩小后发灰"调的，
+   动图与视频本来就已经是成品，再拉一遍会显得脏。 */
+.pet-photo-media .pet-photo {
+  filter: none;
+}
+
+.pet-photo-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(160deg, #16203a, #0b0f1c);
+  color: var(--text-sub);
+  font-size: 12px;
+  text-align: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.pet-photo-empty small {
+  color: var(--text-weak);
+  font-size: 10px;
+}
+
+/* 嘴：高度与宽度都由 --ap 推出。1 帧 1 次写入，多个元素各自换算 */
+.pet-mouth {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  height: calc(5px + var(--ap, 0) * 26px);
+  width: calc(24px + var(--ap, 0) * 18px);
+  border-radius: 50% 50% 50% 50% / 40% 40% 60% 60%;
+  /* 深色 + 轻模糊：任意照片上都不突兀，也不会像贴了张黑纸 */
+  background: radial-gradient(ellipse at 50% 35%, rgba(58, 16, 20, 0.92), rgba(18, 6, 8, 0.88));
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.6);
+  opacity: calc(0.12 + var(--ap, 0) * 0.88);
+  pointer-events: none;
+}
+
+/* 眼睑：从上往下盖住眼位。用 overflow 裁剪而不是改高度，
+   因为改高度会把眼形拉扁，看起来像眯成一条缝而不是闭眼 */
+.pet-eyes {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 16%;
+  width: 56%;
+  justify-content: center;
+  pointer-events: none;
+}
+.pet-eyes i {
+  position: relative;
+  display: block;
+  width: 22%;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  overflow: hidden;
+}
+/* 眼睑本体：位于眼位上方，按 --lid 下滑 */
+.pet-eyes i::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--lid-color, rgba(26, 18, 16, 0.82));
+  filter: blur(1.5px);
+  transform: translateY(calc(-100% + var(--lid, 0) * 100%));
+}
+
+/* 说话时的边界辉光：不看字幕也能知道它在说 */
+.pet-speaking-glow {
+  position: absolute;
+  inset: -4%;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 220ms ease;
+  background: radial-gradient(circle, rgba(34, 211, 238, 0) 62%, rgba(34, 211, 238, 0.42) 100%);
+}
+[data-mood='speaking'] .pet-speaking-glow {
+  opacity: calc(0.35 + var(--ap, 0) * 0.65);
+}
+
+/* 光环：静态底圈，让头像在任意桌面上都有边界 */
+.pet-halo {
+  position: absolute;
+  width: 104%;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(circle, rgba(34, 211, 238, 0.16) 40%, rgba(34, 211, 238, 0) 72%);
+}
+[data-mood='alarm'] .pet-halo {
+  background: radial-gradient(circle, rgba(255, 77, 109, 0.34) 40%, rgba(255, 77, 109, 0) 74%);
+}
+[data-mood='thinking'] .pet-halo {
+  background: radial-gradient(circle, rgba(232, 121, 249, 0.24) 40%, rgba(232, 121, 249, 0) 74%);
+}
+[data-mood='listening'] .pet-halo {
+  background: radial-gradient(circle, rgba(34, 211, 238, 0.3) 40%, rgba(34, 211, 238, 0) 74%);
+}
+
+/* 状态胶囊 */
+.pet-mood {
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 11px;
+  background: rgba(6, 8, 16, 0.62);
+  backdrop-filter: blur(6px);
+  white-space: nowrap;
+}
+.pet-mood i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: block;
+}
+[data-mood='speaking'] .pet-mood i,
+[data-mood='listening'] .pet-mood i {
+  animation: pet-pulse 1.1s ease-in-out infinite;
+}
+@keyframes pet-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.28; }
+}
+
+/* ═══════════ 字幕 ═══════════ */
+.pet-captions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 138px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.pet-cap {
+  padding: 7px 10px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  /* 玻璃底：不透明就毁了透明窗 */
+  background: rgba(11, 13, 22, 0.74);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(42, 51, 72, 0.7);
+  word-break: break-word;
+}
+.pet-cap.user {
+  border-color: rgba(34, 211, 238, 0.42);
+  color: var(--text-main);
+}
+.pet-cap.ai {
+  border-color: rgba(42, 51, 72, 0.7);
+}
+.pet-cap.interim {
+  color: var(--text-sub);
+  font-style: italic;
+  border-style: dashed;
+}
+.pet-cap-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 10px;
+  color: var(--text-weak);
+}
+.pet-cap-p0 {
+  border-color: rgba(255, 77, 109, 0.7);
+  background: rgba(46, 12, 20, 0.82);
+}
+/**
+ * P0 条目的标签行必须单独给色，**不能沿用通用的 --text-weak**。
+ *
+ * 实测（浏览器里读 `getComputedStyle`，不是看图猜）：
+ * `--text-weak` = `#5C6478`，压在 P0 条的深红底上——
+ * 而该底色是 `rgba(46,12,20,0.82)`，**会与身后的页面/桌面合成**：
+ *   · 叠在最暗处 → 约 3.0:1
+ *   · 叠在白底上（Electron 透明窗后面可能是任何东西，含纯白）→ **约 1.8:1**
+ * 这行字的内容恰恰是"紧急报警"本身 —— 整条里最该被看见的字用了最弱的色。
+ *
+ * 现用 `#FF94A8`：按**最坏情况（叠纯白）**算仍 ≥ 5.3:1，满足 WCAG AA 小字 4.5:1。
+ * `scripts/pet-smoke.ts` 的 P11 按同一口径钉住它（口径写死在断言里，改动会变红）。
+ */
+.pet-cap-p0 .pet-cap-meta {
+  color: #ff94a8;
+}
+
+/* ═══════════ 控制条 ═══════════ */
+.pet-controls {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pet-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pet-flex1 {
+  flex: 1 1 auto;
+}
+
+.pet-mic {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(42, 51, 72, 0.85);
+  background: rgba(11, 13, 22, 0.78);
+  backdrop-filter: blur(10px);
+  color: var(--text-main);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.pet-mic.on {
+  border-color: var(--primary);
+  color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-10);
+}
+.pet-mic:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.pet-mic-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-weak);
+}
+.pet-mic.on .pet-mic-dot {
+  background: var(--primary);
+  animation: pet-pulse 1.1s ease-in-out infinite;
+}
+
+.pet-icon-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid rgba(42, 51, 72, 0.85);
+  background: rgba(11, 13, 22, 0.78);
+  backdrop-filter: blur(10px);
+  color: var(--text-sub);
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+}
+.pet-icon-btn:hover {
+  color: var(--text-main);
+  border-color: var(--border-strong);
+}
+
+.pet-say {
+  display: flex;
+  gap: 6px;
+}
+.pet-say input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(42, 51, 72, 0.85);
+  background: rgba(11, 13, 22, 0.8);
+  backdrop-filter: blur(10px);
+  color: var(--text-main);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+}
+.pet-say input:focus {
+  border-color: var(--primary-40);
+}
+.pet-say button {
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--primary-40);
+  background: rgba(34, 211, 238, 0.14);
+  color: var(--primary);
+  font-size: 12.5px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.pet-say button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 判定说明条：「说了没反应」时唯一能解释原因的入口 */
+.pet-verdict {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  background: rgba(6, 8, 16, 0.66);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(42, 51, 72, 0.6);
+  color: var(--text-weak);
+}
+.pet-verdict.pass {
+  border-color: rgba(34, 211, 238, 0.5);
+  color: var(--primary);
+}
+.pet-verdict.block {
+  border-color: rgba(255, 176, 32, 0.5);
+  color: var(--warning);
+}
+.pet-verdict .mono {
+  font-family: var(--font-mono);
+}
+
+.pet-foot {
+  font-size: 10px;
+  color: var(--text-weak);
+  text-align: center;
+}
+
+/* 待确认：金额必须最醒目 —— 用户要复述的就是它 */
+.pet-confirm {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 176, 32, 0.65);
+  background: rgba(40, 28, 6, 0.82);
+  backdrop-filter: blur(10px);
+  font-size: 11.5px;
+}
+.pet-confirm-amt {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--warning);
+}

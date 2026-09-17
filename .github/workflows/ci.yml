@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run backtest:golden
+      - run: npm run build
+      - name: Upload golden report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: golden-report
+          path: artifacts/golden-report.json
+          if-no-files-found: ignore
+      - run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+      - name: On-chain quote smoke (mainnet public RPC)
+        run: node quote-check.cjs
+        continue-on-error: true
