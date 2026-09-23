@@ -22,11 +22,35 @@ export interface OrderIntentInput {
   instType?: 'SPOT' | 'SWAP'
   /** 合约结算方式（仅 SWAP 有意义）：linear=U 本位，inverse=币本位。 */
   settle?: 'linear' | 'inverse'
+  /**
+   * 止盈 / 止损 —— **绝对价**。
+   *
+   * ★ 这两个字段原先不存在，而「不存在」的表现不是报错：`parseProtection`
+   *   解析对了、`describeContractOrder` 念回了、`VOICE_COMMAND` 记下了，
+   *   然后 `submitToBroker` 只传 5 个字段 —— 下一张**裸单**。
+   *   用户以为设了保护、实际在裸跑（2026-08-22 实测确认）。
+   *
+   * ★ 为什么是价不是比例：见 `protection.ts`。比例会随标记价漂移，
+   *   用户在 86000 说的"止损 1%"指的是 85140 这个价位。
+   */
+  takeProfit?: number
+  stopLoss?: number
 }
 
 export type RiskDecision = { ok: true; notional: number } | { ok: false; reason: string }
 
-export function preTradeCheck(state: OrchState, intent: OrderIntentInput, markPrice: number): RiskDecision {
+/**
+ * 下单前风控。
+ *
+ * ★★ `markPrice` 是 `number | null`，`null` = **没有真实报价**（见 `markPriceOf`）。
+ *   2026-09-22 修：这里原来是 `markPrice: number`，而调用方传的是 `?? 0` 的结果。
+ *   于是市价单的 `refPrice = 0` ⇒ `notional = 0` ⇒ 下面那道
+ *   `NOTIONAL_EXCEEDS_LIMIT` **永远不触发** —— 一道上限被静默拆掉。
+ *   ⇒ 现在**拿不到参考价就直接拒**（fail-closed），拒的理由要说出"是拿不到报价"，
+ *     而不是伪装成"名义额没超"。这两件事指向的动作完全不同（判据 C5）：
+ *     前者去查行情通道，后者去改资金帽。
+ */
+export function preTradeCheck(state: OrchState, intent: OrderIntentInput, markPrice: number | null): RiskDecision {
   if (state.killswitch) return { ok: false, reason: 'KILLSWITCH_ACTIVE' }
   if (!intent.clientOrderId) return { ok: false, reason: 'MISSING_CLIENT_ORDER_ID' }
   if (!Number.isFinite(intent.qty) || intent.qty <= 0) return { ok: false, reason: 'INVALID_QTY' }
@@ -35,6 +59,14 @@ export function preTradeCheck(state: OrchState, intent: OrderIntentInput, markPr
   }
 
   const refPrice = intent.type === 'limit' ? (intent.price as number) : markPrice
+  if (refPrice === null || !Number.isFinite(refPrice) || refPrice <= 0) {
+    return {
+      ok: false,
+      reason:
+        `NO_REFERENCE_PRICE（${intent.symbol} 还没有真实报价，算不出名义额）` +
+        `—— 不是"名义额没超限"，是这道上限**这次没能被检查**`,
+    }
+  }
 
   // ── 参数配伍检查（必须早于规模检查）─────────────────────────────
   // 「高杠杆」与「现货」各自合法、组合非法。若不在此拦下，场所会用
@@ -55,7 +87,7 @@ export function preTradeCheck(state: OrchState, intent: OrderIntentInput, markPr
     return { ok: false, reason: `NOTIONAL_EXCEEDS_LIMIT (${notional.toFixed(0)} > ${state.risk.maxNotionalPerOrder})` }
   }
 
-  if (markPrice > 0 && Number.isFinite(refPrice)) {
+  if (markPrice !== null && markPrice > 0 && Number.isFinite(refPrice)) {
     const devBps = Math.abs(refPrice - markPrice) / markPrice * 10_000
     if (devBps > state.risk.priceDeviationBps) {
       return { ok: false, reason: `PRICE_DEVIATION_TOO_WIDE (${devBps.toFixed(0)}bps)` }

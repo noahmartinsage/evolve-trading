@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runInSandbox, sandboxNodeArgs } from '../server/sandbox/index.ts'
@@ -111,10 +111,22 @@ async function attempt(name, fn) {
   console.log('###RESULT###' + JSON.stringify({ tries }));
 })();
 `
-  const probe = spawnSync(process.execPath, [...sandboxNodeArgs(), '-e', probeCode], {
-    encoding: 'utf-8',
-    timeout: 15_000,
-    env: probeEnv,
+  // ★★ 用**异步** `execFile`，不用 `spawnSync`（2026-09-22 修）。
+  //   本机实测（`_diag_spawn.cjs`）：agent 环境注入的 node shim 下，
+  //   `spawnSync` / `execSync` **恒 EBUSY**，而 `spawn` / `exec`（异步）正常。
+  //   用同步版本会让这条门禁把"进程起不来"报成"S2 出网通道没封住"，
+  //   指向完全相反的动作（判据 C5 / A1：误报比漏报贵）。
+  //   回调形态刻意**不 reject**：探针的结果靠 stdout 里的协议行判定，
+  //   起不来时后续那两条 `fail(...)` 会带真实原因说话，比抛栈清楚。
+  const probe = await new Promise<{ stdout: string; stderr: string }>((resolve) => {
+    execFile(
+      process.execPath,
+      [...sandboxNodeArgs(), '-e', probeCode],
+      { encoding: 'utf-8', timeout: 15_000, env: probeEnv },
+      (err, stdout, stderr) => {
+        resolve({ stdout: stdout ?? '', stderr: stderr ?? (err ? String(err.message) : '') })
+      },
+    )
   })
   const line = (probe.stdout ?? '').split('\n').find((l) => l.startsWith('###RESULT###')) ?? ''
   let verdict: { tries?: [string, string][] } = {}

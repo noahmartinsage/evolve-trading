@@ -27,6 +27,7 @@ import {
   getTtsEngine,
   getVoiceConfig,
   getVoiceDaily,
+  getVoiceTranscript,
   matchBrowserVoice,
   postInterrupt,
   postUtterance,
@@ -53,6 +54,7 @@ import type {
   VoiceProfileView,
   VoiceReplyView,
   VoiceStatusView,
+  VoiceTranscriptView,
 } from './client.ts'
 
 import { withCatalog } from './configShape.ts'
@@ -119,6 +121,10 @@ export interface VoiceSession {
   spokenLocal: number
   saveNote: string | null
   daily: DailyBriefView | null
+  /** 历史对话（落盘）。`null` = 还没读过 —— 与"读到了 0 条"是两件事。 */
+  transcript: VoiceTranscriptView | null
+  /** 读记录失败的原因。**必须与 `turns.length === 0` 分开显示**（判据 24）。 */
+  transcriptError: string | null
 
   // ── 动作 ──
   say: (text: string) => Promise<void>
@@ -126,6 +132,8 @@ export interface VoiceSession {
   bargeIn: (reason?: string) => void
   patchConfig: (patch: Partial<Omit<VoiceConfigView, 'catalog'>>) => Promise<void>
   readDaily: () => Promise<void>
+  /** 读一页历史对话。`more: true` 取更早的一页并接在已有记录后面。 */
+  loadTranscript: (opts?: { more?: boolean }) => Promise<void>
 }
 
 export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
@@ -155,6 +163,16 @@ export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
   const [spokenLocal, setSpokenLocal] = useState(0)
   const [saveNote, setSaveNote] = useState<string | null>(null)
   const [daily, setDaily] = useState<DailyBriefView | null>(null)
+  const [transcript, setTranscript] = useState<VoiceTranscriptView | null>(null)
+  const [transcriptError, setTranscriptError] = useState<string | null>(null)
+  /**
+   * 最近一次读到的记录。
+   *
+   * ★ **不放返回值**：`react-hooks/refs` 会把"返回值里带 ref"判成渲染期读 ref
+   *   （本项目实测过 32 条报错）。它只是给"更早一页"算游标用的内部状态，
+   *   没有 React 之外的东西需要读它。
+   */
+  const transcriptRef = useRef<VoiceTranscriptView | null>(null)
   const [speaking, setSpeakingState] = useState(false)
   const [engine, setEngine] = useState<TtsEngineView | null>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
@@ -399,6 +417,46 @@ export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
   }, [refreshEngine])
 
   // ── 说话 ──
+  /**
+   * 读一页历史对话（Task #114）。
+   *
+   * ★ 定义在 `say` **之前**，因为 `say` 成功后会调它刷新 —— 反过来写
+   *   会撞上 `const` 的暂时性死区（`Block-scoped variable used before
+   *   its declaration`）。这不是风格问题，是真实的编译错误。
+   *
+   * ★ 失败**不吞**：`transcriptError` 会被面板显示出来。这与 `readDaily` 里
+   *   那几处 `.catch(() => undefined)` 是**有意不同**的 —— 那里失败最多是
+   *   "数字没刷新"，而这里失败会让界面显示"你没聊过"，那是一句假话。
+   *   （判据 24：缺数据要说出来；沉默的失败会伪装成"没问题"。）
+   *
+   * ★ 翻页游标用**时间戳**：`turnId` 是进程内自增，重启后会重复，
+   *   拿它翻页会跳过或重复整段记录。
+   */
+  const loadTranscript = useCallback(
+    async (opts?: { more?: boolean }) => {
+      const more = opts?.more === true
+      const prev = transcriptRef.current
+      // 还没读过第一页就谈不上"更早"
+      if (more && !prev) return
+      const beforeAt = more && prev && prev.turns.length > 0 ? prev.turns[prev.turns.length - 1].at : undefined
+      try {
+        // ★ 必须带 token：这是语音线上**唯一带 token 的只读端点** ——
+        //   它给的是逐字正文（持仓、金额、下单原话），不是聚合数字。
+        //   不带的话服务端 401，面板会显示"读不到对话记录"，
+        //   而用户会以为自己从没聊过（判据 24：缺数据要说出来，
+        //   但"说不出来"与"真的没有"必须能分辨）。
+        const page = await getVoiceTranscript(base, token, beforeAt !== undefined ? { beforeAt } : {})
+        const next: VoiceTranscriptView = more && prev ? { ...page, turns: [...prev.turns, ...page.turns] } : page
+        transcriptRef.current = next
+        setTranscript(next)
+        setTranscriptError(null)
+      } catch (e) {
+        setTranscriptError(e instanceof Error ? e.message : String(e))
+      }
+    },
+    [base, token],
+  )
+
   const say = useCallback(
     async (text: string) => {
       const t = text.trim()
@@ -413,6 +471,10 @@ export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
         //   念出来用户就会听到"答非所问"
         if (!r.dropped && r.reply.trim()) speakerRef.current?.enqueue(r.reply, 'P1_IMPORTANT')
         reloadConfig()
+        // 面板开着的时候，说完一句就把记录刷一遍 —— 否则用户要手动点刷新才
+        // 看得到自己刚说的那句，而"我刚明明说了"配上一个没变的列表，
+        // 会被读成"系统没记下来"。只刷**首页**，不打断正在翻的历史页。
+        if (transcriptRef.current) void loadTranscript()
       } catch (e) {
         pushToast(dispatch, `❌ 语音请求失败：${e instanceof Error ? e.message : e}`)
       } finally {
@@ -420,7 +482,7 @@ export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
         setInterim('')
       }
     },
-    [base, token, busy, pushLines, reloadConfig, dispatch],
+    [base, token, busy, pushLines, reloadConfig, dispatch, loadTranscript],
   )
 
   const bargeIn = useCallback(
@@ -536,6 +598,7 @@ export function useVoiceSession(opts: VoiceSessionOptions = {}): VoiceSession {
     status, stream, speech, caps,
     engine, engineError, speaker: speakerStats, preview, refreshEngine,
     interim, busy, verdict, lastReply, lastUtterance, speaking, spokenLocal, saveNote, daily,
-    say, bargeIn, patchConfig, readDaily,
+    transcript, transcriptError,
+    say, bargeIn, patchConfig, readDaily, loadTranscript,
   }
 }

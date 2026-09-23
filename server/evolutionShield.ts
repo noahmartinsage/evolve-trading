@@ -353,31 +353,84 @@ export interface DecayResult {
  *
  * 阈值：健康分 < 40 视为失效，自动 enabled=false（保留记录以便审计，不物理删除）。
  */
+export interface DecayForecastRow {
+  id: string
+  ruleText: string
+  healthNow: number
+  healthNext: number
+  willArchive: boolean
+}
+
+export interface DecayForecast {
+  now: number
+  archiveThreshold: number
+  /** 参与衰减的心法（基准心法与已停用的不在内）。 */
+  rows: DecayForecastRow[]
+  wouldDecay: string[]
+  wouldArchive: string[]
+}
+
+/**
+ * 衰减的**只读预演**：按当前时间算一遍"下一轮衰减会动谁"，但不落盘。
+ *
+ * ★ 提出来是为了让"衰减公式"只存在一份。此前这套公式只写在 `decayLessons`
+ * 里，于是任何想回答"哪些心法快失效了"的地方（面板、语音、巡检 agent）
+ * 只能**抄一遍公式**或者**真的跑一次衰减再回滚** —— 前者必然漂移，
+ * 后者是在只读问句上做写操作。现在两边都调它。
+ *
+ * 它也是"未执行"与"已执行"的区分点：`decayLessons` 是**执行**，
+ * 这个是**预演**。两者返回值形状一致，所以调用方不会把预演当执行。
+ */
+export function decayForecast(now: number = Date.now(), archiveThreshold = 40): DecayForecast {
+  const rows: DecayForecastRow[] = []
+  for (const lesson of loadLessons()) {
+    if (lesson.isBaseline) continue // 基准心法由人工回滚管理，不参与自动衰减
+    if (!lesson.enabled) continue
+    const elapsedDays = Math.max((now - lesson.createdAt) / 86_400_000, 0)
+    const decayAmount = 100 * (elapsedDays / Math.max(lesson.ttlDays, 1)) * 0.5
+    const healthNext = Math.round(Math.max(lesson.healthScore - decayAmount, 0) * 10) / 10
+    rows.push({
+      id: lesson.id,
+      ruleText: lesson.ruleText,
+      healthNow: lesson.healthScore,
+      healthNext,
+      willArchive: healthNext > 0 && healthNext < archiveThreshold,
+    })
+  }
+  return {
+    now,
+    archiveThreshold,
+    rows,
+    wouldDecay: rows.filter((r) => r.healthNext !== r.healthNow).map((r) => r.id),
+    wouldArchive: rows.filter((r) => r.willArchive).map((r) => r.id),
+  }
+}
+
 export function decayLessons(now: number = Date.now(), archiveThreshold = 40): DecayResult {
+  // 公式住在 `decayForecast` 里，这里只负责**执行**它算出来的结果。
+  const fc = decayForecast(now, archiveThreshold)
+  if (fc.wouldDecay.length === 0 && fc.wouldArchive.length === 0) return { decayed: [], archived: [] }
+
   const lessons = loadLessons()
+  const byId = new Map(fc.rows.map((r) => [r.id, r]))
   const decayed: string[] = []
   const archived: string[] = []
 
   for (const lesson of lessons) {
-    if (lesson.isBaseline) continue // 基准心法由人工回滚管理，不参与自动衰减
-    if (!lesson.enabled) continue
-
-    const elapsedDays = Math.max((now - lesson.createdAt) / 86_400_000, 0)
-    const decayAmount = 100 * (elapsedDays / Math.max(lesson.ttlDays, 1)) * 0.5
-    const next = Math.max(lesson.healthScore - decayAmount, 0)
-
-    if (next !== lesson.healthScore) {
-      lesson.healthScore = Math.round(next * 10) / 10
+    const row = byId.get(lesson.id)
+    if (!row) continue
+    if (row.healthNext !== lesson.healthScore) {
+      lesson.healthScore = row.healthNext
       decayed.push(lesson.id)
     }
-    if (lesson.healthScore > 0 && lesson.healthScore < archiveThreshold) {
+    if (row.willArchive) {
       lesson.enabled = false
       lesson.shieldStatus = 'DECAYED'
       archived.push(lesson.id)
     }
   }
 
-  if (decayed.length > 0 || archived.length > 0) persist(lessons)
+  persist(lessons)
   return { decayed, archived }
 }
 

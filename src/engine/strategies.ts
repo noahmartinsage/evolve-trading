@@ -5,6 +5,7 @@ import type { BacktestResult } from './backtest.ts'
 import { computeReport } from './report.ts'
 import type { Report } from './report.ts'
 import { computeFitness } from './fitness.ts'
+import { closesOf, memoDerived, seriesOf } from './seriesCache.ts'
 
 export interface StrategyContext {
   i: number
@@ -50,9 +51,10 @@ export function maCrossStrategy(fast: number, slow: number): Strategy {
     params,
     decide(ctx) {
       if (ctx.i < slow + 1) return null
-      const closes = ctx.candles.map((c) => c.c)
-      const f = sma(closes, fast)
-      const s = sma(closes, slow)
+      // 指标必须走缓存：decide 每根 bar 调一次，直接重算就是 O(n²)。
+      // 缓存键里带参数，避免"拿 A 参数的指标算 B 参数"。
+      const f = seriesOf(ctx.candles, `sma:${fast}`, (c) => sma(c, fast))
+      const s = seriesOf(ctx.candles, `sma:${slow}`, (c) => sma(c, slow))
       const prevGap = f[ctx.i - 1] - s[ctx.i - 1]
       const currGap = f[ctx.i] - s[ctx.i]
       if (Number.isNaN(prevGap) || Number.isNaN(currGap)) return null
@@ -78,8 +80,7 @@ export function rsiReversionStrategy(period: number, lower: number, upper: numbe
     params,
     decide(ctx) {
       if (ctx.i < period + 2) return null
-      const closes = ctx.candles.map((c) => c.c)
-      const values = rsi(closes, period)
+      const values = seriesOf(ctx.candles, `rsi:${period}`, (c) => rsi(c, period))
       const v = values[ctx.i]
       if (Number.isNaN(v)) return null
       if (v < lower && ctx.posQty <= 1e-12) {
@@ -128,9 +129,9 @@ export function bollingerReversionStrategy(period: number, numStd: number): Stra
     params,
     decide(ctx) {
       if (ctx.i < period + 1) return null
-      const closes = ctx.candles.map((c) => c.c)
-      const mid = sma(closes, period)
-      const sd = stddev(closes, period)
+      const closes = closesOf(ctx.candles)
+      const mid = seriesOf(ctx.candles, `sma:${period}`, (c) => sma(c, period))
+      const sd = seriesOf(ctx.candles, `stddev:${period}`, (c) => stddev(c, period))
       const m = mid[ctx.i]
       const s = sd[ctx.i]
       if (Number.isNaN(m) || Number.isNaN(s) || s === 0) return null
@@ -162,8 +163,10 @@ export function macdTrendStrategy(fast: number, slow: number, signalPeriod: numb
     params,
     decide(ctx) {
       if (ctx.i < slow + signalPeriod + 1) return null
-      const closes = ctx.candles.map((c) => c.c)
-      const { hist } = macd(closes, fast, slow, signalPeriod)
+      const closes = closesOf(ctx.candles)
+      const { hist } = memoDerived(ctx.candles, `macd:${fast}:${slow}:${signalPeriod}`, () =>
+        macd(closes, fast, slow, signalPeriod),
+      )
       const h0 = hist[ctx.i]
       const h1 = hist[ctx.i - 1]
       if (Number.isNaN(h0) || Number.isNaN(h1)) return null
@@ -214,9 +217,9 @@ export function emaRsiComboStrategy(emaPeriod: number, rsiPeriod: number, lower:
     params,
     decide(ctx) {
       if (ctx.i < Math.max(emaPeriod, rsiPeriod) + 1) return null
-      const closes = ctx.candles.map((c) => c.c)
-      const e = ema(closes, emaPeriod)
-      const r = rsi(closes, rsiPeriod)
+      const closes = closesOf(ctx.candles)
+      const e = seriesOf(ctx.candles, `ema:${emaPeriod}`, (c) => ema(c, emaPeriod))
+      const r = seriesOf(ctx.candles, `rsi:${rsiPeriod}`, (c) => rsi(c, rsiPeriod))
       const emaV = e[ctx.i]
       const emaPrev = e[ctx.i - 1]
       const rsiV = r[ctx.i]
@@ -300,8 +303,20 @@ export function evaluateStrategy(candles: Candle[], strategy: Strategy, barMinut
   return evaluate(candles, strategy, barMinutes)
 }
 
-export function evaluateCandidateGrid(candles: Candle[], barMinutes = 15): CandidateResult[] {
-  return buildCandidateSet()
+/**
+ * 候选网格。
+ *
+ * `extra` 是**因子生产线接进策略生产的唯一入口**：把台账里通过策略层筛查的
+ * 因子策略递进来，它们就与手写网格一起参与适应度排序、一起进过拟合门的候选场。
+ *
+ * ★ 默认值是 `[]`，且**必须**保持是 `[]`。
+ *   `scripts/golden-backtest.ts` 依赖这个函数在固定数据上给出逐位确定的结果，
+ *   悄悄往里塞候选会把 golden 门禁变成一条会动的准线 ——
+ *   它就会开始对正确的输入报错（判据 2）。
+ *   所以注入是**显式**的：谁要因子策略，谁自己传。
+ */
+export function evaluateCandidateGrid(candles: Candle[], barMinutes = 15, extra: Strategy[] = []): CandidateResult[] {
+  return [...buildCandidateSet(), ...extra]
     .map((s) => evaluate(candles, s, barMinutes))
     .sort((a, b) => b.fitness - a.fitness)
 }

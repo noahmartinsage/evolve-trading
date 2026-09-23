@@ -1,4 +1,5 @@
 import type { OrderSide, OrderStatus, OrderType } from '../src/engine/index.ts'
+import type { PositionProtection } from './protection.ts'
 import {
   MAX_DRAWDOWN_PCT,
   MAX_NOTIONAL_PER_ORDER,
@@ -82,4 +83,14 @@ export interface OrchState {
   equityCurve: EquityPoint[]
   risk: RiskConfig
   submitTimestamps: number[]
+  /**
+   * 保护单台账：symbol → 这道仓位的止盈/止损（绝对价）。
+   *
+   * ★ 与 `positions` **分开存**，不是冗余：两者生命周期不同。
+   *   市价单在纸面引擎里要等下一根 bar 才成交（`matching.ts` 的
+   *   `eligibleFromBar`），所以"保护已经挂上"与"持仓已经存在"之间
+   *   有一段真实的时间差。挂在 `positions` 上就必须等持仓出现才记 ——
+   *   而那段窗口里用户以为有保护、实际什么都没有。
+   */
+  protection: Map<string, PositionProtection>
 }

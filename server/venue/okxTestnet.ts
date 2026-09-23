@@ -18,6 +18,42 @@ function roundQuote(px: number, settle: SwapSettlement): number {
   return Math.round(px * f) / f
 }
 
+/**
+ * 把 `VenueProtection` 翻成 OKX 的 `attachAlgoOrds` 元素。
+ *
+ * ── 为什么是 `attachAlgoOrds` 而不是"成交后再下一张条件单" ─────────────
+ * 见 `VenueProtection` 的注释：后者会留一段**真实的裸窗**。
+ * `attachAlgoOrds` 是**随主单同一笔请求**提交的，场所侧要么两者都受理、
+ * 要么整笔驳回 —— 那正是"不会有一段没保护的仓位"这句话的技术含义。
+ *
+ * ★ `tpOrdPx`/`slOrdPx` 都给 `-1`（= 触发后市价成交）。刻意**不**挂限价：
+ *   限价在剧烈行情里会触发而不成交（价格穿过去了、单子还挂着），
+ *   于是保护"触发了"而仓位还在 —— 那比没有保护更难发现。
+ *
+ * ★ 只给了一道就只挂一道：只设止损是合法诉求，替用户补另一半等于替他做了主张。
+ *
+ * ★ 导出它是**刻意的**：这是个纯函数（给定保护给出一段 JSON），而它承担的语义
+ *   决定（`-1` = 触发后市价、只挂给出的那一道、报价精度）此前在测试里
+ *   **一个字都没被断过** —— 因为它在适配器内部，而适配器的 `place()` 要出网。
+ *   判据：纯函数才能离线逐条断言；不导出就只能靠"发一笔真单看看"。
+ */
+export function attachAlgo(
+  p: { takeProfitPrice?: number; stopLossPrice?: number } | undefined,
+  settle: SwapSettlement,
+): Record<string, string> | undefined {
+  if (!p) return undefined
+  const out: Record<string, string> = {}
+  if (Number.isFinite(p.takeProfitPrice) && (p.takeProfitPrice as number) > 0) {
+    out.tpTriggerPx = String(roundQuote(p.takeProfitPrice as number, settle))
+    out.tpOrdPx = '-1'
+  }
+  if (Number.isFinite(p.stopLossPrice) && (p.stopLossPrice as number) > 0) {
+    out.slTriggerPx = String(roundQuote(p.stopLossPrice as number, settle))
+    out.slOrdPx = '-1'
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 /** 受限网络（如 OKX 被 geo-block）下通过 HTTP/HTTPS 代理出海。仅当设置了 HTTPS_PROXY/HTTP_PROXY 时启用；不影响模拟盘本质。 */
 let proxyConfigured = false
 async function ensureProxy(): Promise<void> {
@@ -61,6 +97,17 @@ function sanitizeClOrdId(raw: string): string {
 
 export class OkxTestnetAdapter implements VenueAdapter {
   readonly name = 'okx-testnet'
+  /**
+   * ★★ `true` —— OKX 用 `attachAlgoOrds` 把止盈止损**随主单一起**提交，
+   *   场所侧在同一笔请求里受理两者。所以不存在"开仓成交了、保护还没挂上"
+   *   的那一段真实裸窗（见 `VenueProtection` 的注释：那一段正是本仓库拒收
+   *   "成交后再另下条件单"那种做法的原因）。
+   *
+   * ★ 这个能力位是**生产入口**，不只是给测试看的：语音实盘下单会读它，
+   *   为假就拒单。所以它必须与下面 `attachAlgoOrds` 的实现事实一致 ——
+   *   真去掉了附挂却忘了改这里，等于把"有保护"说成事实（红线：灰区不许装成绿）。
+   */
+  readonly supportsVenueProtection = true
   private apiKey: string
   private apiSecret: string
   private passphrase: string
@@ -94,7 +141,16 @@ export class OkxTestnetAdapter implements VenueAdapter {
     }
   }
 
-  private async signed<T>(method: 'GET' | 'POST' | 'DELETE', path: string, params: Record<string, unknown> = {}): Promise<T> {
+  /**
+   * ★ `params` 允许是**数组**：OKX 有几个接口（撤算法单等）要的是 JSON 数组体。
+   *   收窄成 `Record` 会逼调用方把它包成 `{0: …}`，而那种包法在线上不会报错 ——
+   *   场所会用一个与真因无关的理由（参数缺失）驳回，排查方向就此跑偏。
+   */
+  private async signed<T>(
+    method: 'GET' | 'POST' | 'DELETE',
+    path: string,
+    params: Record<string, unknown> | unknown[] = {},
+  ): Promise<T> {
     await ensureProxy()
     const ts = new Date().toISOString()
     let qs = ''
@@ -156,6 +212,8 @@ export class OkxTestnetAdapter implements VenueAdapter {
       const px = intent.side === 'buy' ? tp * 1.001 : tp * 0.999
       payload.px = String(Math.round(px * 10) / 10)
     }
+    const algo = attachAlgo(intent.protection, 'linear')
+    if (algo) payload.attachAlgoOrds = [algo]
     const res = await this.signed<{ code: string; msg: string; data: { ordId: string }[] }>('POST', '/api/v5/trade/order', payload)
     this.watchSymbol(intent.symbol)
     return { venueOrderId: `OKX-${res.data[0].ordId}@${instId}` }
@@ -205,6 +263,11 @@ export class OkxTestnetAdapter implements VenueAdapter {
     const px = intent.type === 'limit' && intent.price !== undefined ? intent.price : intent.side === 'buy' ? refPrice * 1.001 : refPrice * 0.999
     payload.px = String(roundQuote(px, settle))
 
+    // ★ 合约的止盈止损同样走 `attachAlgoOrds`（随主单原子附挂）。
+    //   合约尤其需要它：125 倍的强平距离只有百分之几，而本地巡检随进程存活 ——
+    //   进程一停、仓位还在场所，那就不是"保护变慢"，是"没有保护"。
+    const algo = attachAlgo(intent.protection, settle)
+    if (algo) payload.attachAlgoOrds = [algo]
     const res = await this.signed<{ code: string; msg: string; data: { ordId: string }[] }>('POST', '/api/v5/trade/order', payload)
     if (res.data[0] && !res.data[0].ordId) {
       throw new Error(`SWAP_ORDER_NO_ORDID:${instId}`)
@@ -246,6 +309,18 @@ export class OkxTestnetAdapter implements VenueAdapter {
   }
 
   async cancel(venueOrderId: string): Promise<boolean> {
+    // ★ 算法单（止盈止损）与普通挂单在 OKX 是**两套不同的撤单接口**，
+    //   用错接口的表现是"撤单返回 false" —— 而调用方会把它读成"这笔不存在"，
+    //   于是"保护没撤掉"这件事会被记成"本来就没有保护"。两条 id 因此必须可分。
+    const algo = /^OKXALGO-(.+?)@(.+)$/.exec(venueOrderId)
+    if (algo) {
+      try {
+        await this.signed('POST', '/api/v5/trade/cancel-algos', [{ instId: algo[2], algoId: algo[1] }])
+        return true
+      } catch {
+        return false
+      }
+    }
     const m = /^OKX-(.+?)@(.+)$/.exec(venueOrderId)
     if (!m) return false
     try {
@@ -273,6 +348,22 @@ export class OkxTestnetAdapter implements VenueAdapter {
       } catch {
         /* 单一品种类型查询失败不影响另一类；返回已取到的部分而不是整体抛错 */
       }
+      // ★★ 算法单**必须一起列出来**。
+      //   它们挂在 `/orders-algo-pending`，不在 `/orders-pending` 里。
+      //   少了这一段，对账会得出"场所没有任何挂单，本地却有保护"的结论 ——
+      //   而真像是相反的：场所那侧的保护好好的，是**查询取错了接口**。
+      //   那会把人引向"重新挂一道保护"（于是挂了两道），而真正该做的是别动
+      //   （判据 C5：分不清"没有"与"没查对地方"是这类缺陷的固定形态）。
+      try {
+        const res = await this.signed<{ code: string; data: { algoId: string; instId: string }[] }>(
+          'GET',
+          '/api/v5/trade/orders-algo-pending',
+          { instType, ordType: 'conditional' },
+        )
+        out.push(...res.data.map((o) => `OKXALGO-${o.algoId}@${o.instId}`))
+      } catch {
+        /* 同上：algos 取不到不影响普通挂单那份清单 */
+      }
     }
     return out
   }
@@ -298,6 +389,26 @@ export class OkxTestnetAdapter implements VenueAdapter {
       }
     }
     return { cash, positions, totalFills: this.executedFills }
+  }
+
+  /**
+   * 权限自检的**原始材料**。
+   *
+   * ★★ 为什么不能用 `reconcile()` 的返回值顶替：那条路已经把响应加工成
+   *   `BalanceSnapshot`，**丢掉了 `perm` 字段**。而 `classifyKeyScope` 判的正是
+   *   `perm` —— 用加工过的结果去判权限，等于把"提币权限"这个字段先删掉再检查它
+   *   （判据 D7：注释/接口要说真在跑的逻辑；判据 C1：有端点 ≠ 有材料）。
+   *
+   * ★ OKX 的权限字段在 **`/api/v5/account/config`** 的 `perm` 上（形如
+   *   `read_only` / `read_only,trade`），不是 `/account/balance`。`classifyKeyScope`
+   *   的 OKX 分支读的就是 `o.perm`，所以这里必须取 config 那个接口。
+   *   ★ 取错接口的症状很隐蔽：`perm` 缺失 ⇒ 判 `unverifiable`（而不是 ok），
+   *     于是"没查对地方"会一直伪装成"场所没告诉我们"（判据 C5：四种事因长得一样）。
+   */
+  async fetchAccountRaw(): Promise<unknown> {
+    const res = await this.signed<{ code: string; data: Record<string, unknown>[] }>('GET', '/api/v5/account/config', {})
+    // OKX 把载荷包在 data[0] 里；`classifyKeyScope` 吃的是那个对象本身
+    return res.data?.[0] ?? null
   }
 
   async pollFills(): Promise<void> {

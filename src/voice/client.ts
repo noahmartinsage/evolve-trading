@@ -52,6 +52,11 @@ export type {
   NeuralVoiceView,
   TtsStatsView,
   TtsEngineView,
+  VoiceTranscriptView,
+  TranscriptTurnView,
+  TranscriptLineView,
+  TelegramView,
+  TelegramPendingChatView,
 } from './clientTypes.ts'
 
 import type {
@@ -66,6 +71,8 @@ import type {
   VoiceReplyView,
   DailyBriefView,
   TtsEngineView,
+  VoiceTranscriptView,
+  TelegramView,
 } from './clientTypes.ts'
 import { mp3DurationEstimate, neuralWordTicks, speechPathPlan } from './speechPath.ts'
 import type { SpeechEngine } from './speechPath.ts'
@@ -149,6 +156,79 @@ export function getVoiceState(base: string): Promise<VoiceStatusView> {
 
 export function getVoiceDaily(base: string): Promise<DailyBriefView> {
   return voiceFetch<DailyBriefView>(base, '', '/voice/daily')
+}
+
+/**
+ * 查阅桌宠对话记录（Task #114）。
+ *
+ * ★ 走 HTTP 而不是让前端读文件：记录只有一个写入者（服务端会话状态机），
+ *   也就只应该有一个读取口径。前端自己拼一份对话，是必然要漂移的
+ *   —— 而漂移出来的那份恰好没人测。
+ *
+ * ★ 它是语音这条线上**唯一带 token 的只读端点**（`/voice/state` 那些都不带）。
+ *   理由具体：别的只读端点给的是聚合数字，而这一份是**逐字正文** ——
+ *   里面有你的持仓、金额、下单原话。少一个 token 参数，它就变成
+ *   "本机任何进程都能把你说过的话整个读走"。
+ *
+ * ★ 分页用 `beforeAt`（时间戳）：`turnId` 是**进程内**自增，重启后会重复，
+ *   拿它翻页会跳过或重复整段记录。
+ *
+ * ★ 只读。查阅不改任何状态、也不写盘。
+ */
+export function getVoiceTranscript(
+  base: string,
+  token: string,
+  opts: { limit?: number; beforeAt?: number } = {},
+): Promise<VoiceTranscriptView> {
+  const q = new URLSearchParams()
+  if (opts.limit !== undefined) q.set('limit', String(opts.limit))
+  if (opts.beforeAt !== undefined) q.set('beforeAt', String(opts.beforeAt))
+  const qs = q.toString()
+  return voiceFetch<VoiceTranscriptView>(base, token, `/voice/transcript${qs ? `?${qs}` : ''}`)
+}
+
+// ─────────────────── 手机端通道（Telegram）───────────────────
+//
+// ★★ 为什么这一栏必须**带 token**（与 `/voice/state` 那些公开只读端点不同）：
+//   它带着"谁被允许对这个系统下指令"的**名单**，以及敲过门的陌生会话的 id。
+//   少一个 token 参数，本机任何进程都能读到这份名单 —— 拿到它的人不需要 token，
+//   他只需要冒充名单里的那个 chat id 就能下指令。
+//
+// ★ 前端**不做任何本地判定**：能不能放行、放行之后是什么状态，
+//   一律以服务端返回的整份视图为准。前端顺手"乐观更新"一下，
+//   就会出现"界面说放行了、服务端没写进去"这种最难查的偏差。
+
+/**
+ * 读通道状态（含待放行清单与放行名单）。
+ *
+ * ★ `authorized` 由服务端判 —— 前端只管把 token 带上，不做任何前置假设。
+ */
+export function getVoiceTelegram(base: string, token: string): Promise<TelegramView> {
+  return voiceFetch<TelegramView>(base, token, '/voice/telegram')
+}
+
+/**
+ * 放行 / 收回一个会话。
+ *
+ * ★★ 这是**唯一**能改动那份名单的前端入口，而且它只能由人点击触发。
+ *   绝不许有"收到某条消息就自动放行"的路径 —— 那等于"谁先说话谁就是主人"，
+ *   而 bot 的 username 是可被搜到的。服务端那条端点也是按这个前提设计的
+ *   （只认本地令牌，不认任何来自 Telegram 的内容）。
+ *
+ * ★ 返回**整份新视图**：面板上要跟着变的有四处（名单、计数、待放行清单、人话）。
+ *   只回一个布尔量的话前端要再拉一次，而那次可能读到写入前的中间态。
+ */
+export function setVoiceTelegramChat(
+  base: string,
+  token: string,
+  action: 'allow' | 'revoke',
+  chatId: string,
+  label = '',
+): Promise<TelegramView> {
+  return voiceFetch<TelegramView>(base, token, `/voice/telegram/${action}`, {
+    method: 'POST',
+    body: JSON.stringify({ chatId, label }),
+  })
 }
 
 /**

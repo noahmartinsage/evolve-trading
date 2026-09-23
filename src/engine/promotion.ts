@@ -16,6 +16,45 @@ export type Stage =
   | 'full_live'
   | 'rolled_back'
 
+/**
+ * 阶段的**唯一一份**中文名与前进方向序号。
+ *
+ * ── 为什么必须收拢到状态机旁边 ──────────────────────────────────────
+ * 改造前有两份 `STAGE_LABEL`（`MonitorPage` 一份、控制台侧一份），
+ * 且**两份都缺** `testnet_verifying` / `testnet_verified`；两处又都写了
+ * `?? r.stage` 的兜底，于是走到这两个阶段的策略在界面上**直接显示英文原值**，
+ * 而没有任何东西会报红 —— 正是本仓库记过的那一类"不报错不崩、只是用户看不见"的缺陷。
+ *
+ * ⇒ 收成一份，并由 `promotion-smoke` 断言"每个 Stage 都有中文名"。
+ *   将来加阶段时漏改会被门禁当场拦下，而不是靠人记得。
+ *
+ * `RANK` 是**前进方向**序号，只用来回答"谁走得最远"，不是时间顺序。
+ * `rejected` 恒为 0：它不是一个可以比较远近的位置，永远排最后。
+ */
+export const PROMOTION_STAGE_LABEL: Record<Stage, string> = {
+  candidate: '候选',
+  paper_observing: '纸交易观察中',
+  ready_for_small_cap: '待测试网实测',
+  testnet_verifying: '测试网实测中',
+  testnet_verified: '测试网已通过',
+  small_cap_live: '小资金实盘',
+  full_live: '全量实盘',
+  rolled_back: '已回滚',
+  rejected: '已拒绝',
+}
+
+export const PROMOTION_STAGE_RANK: Record<Stage, number> = {
+  full_live: 8,
+  small_cap_live: 7,
+  testnet_verified: 6,
+  testnet_verifying: 5,
+  ready_for_small_cap: 4,
+  paper_observing: 3,
+  candidate: 2,
+  rolled_back: 1,
+  rejected: 0,
+}
+
 export interface FitnessStamp {
   version: string
   value: number

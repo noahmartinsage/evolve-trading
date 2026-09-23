@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useReducer, useCallback, useEffect } from 'react'
 import type { Candle, TickerUpdate } from '../data/market'
+import { DEFAULT_SYMBOL_INTERNAL, MARKET, byInternal } from '../market/registry.ts'
 
-export type PageId = 'overview' | 'voice' | 'mission' | 'brain' | 'terminal' | 'agents' | 'evo' | 'protocol' | 'risk' | 'seam' | 'monitor' | 'settings'
+export type PageId = 'overview' | 'voice' | 'mission' | 'brain' | 'terminal' | 'agents' | 'evo' | 'factors' | 'news' | 'protocol' | 'risk' | 'seam' | 'monitor' | 'settings'
 
 export type TradeMode = 'sim' | 'paper' | 'live'
 
@@ -85,11 +86,24 @@ export interface Trade {
 export interface Pair {
   id: string
   symbol: string
-  price: number
-  change24h: number
-  volume24h: number
-  high24h: number
-  low24h: number
+  /**
+   * 最新价。**没有拿到真实报价时是 `null`，不是 0，也不是任何占位数**。
+   *
+   * ★★ 这条是这一轮修的核心缺陷。原先是 `price: number`，初值写死在源码里
+   *   （`BTC-USDC: 114320`，而当时市价 84001；`ETH-USDC: 3724.5`，市价 2701）。
+   *   交易对列表会被快照刷新，所以列表看着是对的 —— **但下单面板的价格框只在
+   *   切换标的时赋值一次**，于是它把源码里那个编造的数字**冻结在了屏幕上**：
+   *   实测 ETH 报价 2701，而「价格(USDC)」框里写着 3724.5（差 37.9%）。
+   *   更糟的是限价模式下 `entryPrice = parseFloat(price)`，那个假数字会**进入
+   *   预检指纹与实际下单** —— 判据 17：它把用户引向"这就是当前价"这个错误结论。
+   *   ⇒ 改成可空：**不知道就显示"—"**，让类型系统把所有"当它是数字用"的地方
+   *     一个个揪出来（判据 24：缺数据要说出来，不许退化成假值）。
+   */
+  price: number | null
+  change24h: number | null
+  volume24h: number | null
+  high24h: number | null
+  low24h: number | null
 }
 
 export interface EvoLogEntry {
@@ -123,6 +137,14 @@ interface State {
   uptimeSec: number
   toast: string | null
   live: boolean
+  /**
+   * 「现在这些报价是**谁**给的」。
+   *
+   * ★ 它必须是**数据**，不是界面上拼的字符串：来源会随回退链变（第一个源挂了就走第二个），
+   *   而写死的品牌名在那种时候会让屏幕撒谎，撒的正是"这份数是谁给的"这件事。
+   *   `null` = 还没成功拿到过（**不是**"默认是某某"）。
+   */
+  marketSource: string | null
   mode: TradeMode
   risk: RiskSettings
   orchUrl: string
@@ -136,6 +158,7 @@ type Action =
   | { type: 'MARKET_SNAPSHOT'; updates: TickerUpdate[] }
   | { type: 'MARKET_TICK'; update: TickerUpdate }
   | { type: 'SET_LIVE'; live: boolean }
+  | { type: 'SET_MARKET_SOURCE'; source: string | null }
   | { type: 'SET_KLINES'; symbol: string; interval: string; candles: Candle[] }
   | { type: 'PLACE_ORDER'; order: Order }
   | { type: 'CANCEL_ORDER'; id: string }
@@ -161,13 +184,22 @@ const initialAgents: Agent[] = [
   { id: 'a6', name: 'LIQ-ETH-02', strategy: '流动性挖矿', status: 'running', todayPnl: 5400, sharpe: 2.6, tradesToday: 1896, winRate: 72.6, llmCalls: 9180, allocation: 14 },
 ]
 
-const initialPairs: Pair[] = [
-  { id: 'p1', symbol: 'ETH-USDC', price: 3724.5, change24h: 2.4, volume24h: 182.4, high24h: 3788.2, low24h: 3612.9 },
-  { id: 'p2', symbol: 'BTC-USDC', price: 114320, change24h: 1.1, volume24h: 96.8, high24h: 115890, low24h: 112140 },
-  { id: 'p3', symbol: 'SOL-USDC', price: 186.24, change24h: 4.6, volume24h: 54.2, high24h: 191.5, low24h: 177.3 },
-  { id: 'p4', symbol: 'ARB-USDC', price: 1.2432, change24h: -1.8, volume24h: 22.6, high24h: 1.28, low24h: 1.21 },
-  { id: 'p5', symbol: 'OP-USDC', price: 2.8614, change24h: -0.6, volume24h: 12.4, high24h: 2.92, low24h: 2.78 },
-]
+/**
+ * 交易对初值 —— **只有标的、没有价格**。
+ *
+ * ★ 名单来自 `src/market/registry.ts`（唯一事实源），不再在这里抄第二遍。
+ * ★ 价格一律 `null`：进页面到快照回来之间有一段空窗，界面必须显示「—」。
+ *   写任何"示例价"都会变成屏幕上看起来正常的假行情（见 `Pair.price` 的注释）。
+ */
+const initialPairs: Pair[] = MARKET.map((m, i) => ({
+  id: `p${i + 1}`,
+  symbol: m.symbol,
+  price: null,
+  change24h: null,
+  volume24h: null,
+  high24h: null,
+  low24h: null,
+}))
 
 const initialState: State = {
   page: 'overview',
@@ -179,7 +211,8 @@ const initialState: State = {
   trades: [],
   agents: initialAgents,
   pairs: initialPairs,
-  selectedPair: 'ETH-USDC',
+  // ★ 默认标的 = 用户的习惯（BTCUSDT）。名单与默认值同源，见 src/market/registry.ts。
+  selectedPair: DEFAULT_SYMBOL_INTERNAL,
   selectedAgent: 'a1',
   gen: 42,
   population: 36,
@@ -197,6 +230,7 @@ const initialState: State = {
   uptimeSec: 0,
   toast: null,
   live: false,
+  marketSource: null,
   // live 模式不允许跨会话静默恢复，每次启动需重新二次确认
   mode: prefs.mode === 'live' ? 'paper' : prefs.mode ?? 'sim',
   risk: prefs.risk ?? DEFAULT_RISK,
@@ -204,11 +238,6 @@ const initialState: State = {
   orchUrl: prefs.orchUrl && prefs.orchUrl !== 'http://localhost:8787' ? prefs.orchUrl : 'http://localhost:8790',
   orchToken: prefs.orchToken ?? 'dev-insecure-token',
   klines: {},
-}
-
-function roundTo(n: number, d: number) {
-  const m = Math.pow(10, d)
-  return Math.round(n * m) / m
 }
 
 function applyFill(positions: Position[], order: Order, qty: number, price: number): Position[] {
@@ -244,15 +273,14 @@ function reducer(state: State, action: Action): State {
       return { ...state, page: action.page }
 
     case 'TICK': {
-      // 真实行情在线时，模拟心跳仅维持运行时长，不覆盖真实价格
-      if (state.live) return { ...state, uptimeSec: state.uptimeSec + 1 }
-      const pairs = state.pairs.map((p) => {
-        const drift = (Math.random() - 0.48) * p.price * 0.002
-        const price = Math.max(p.price * 0.94, p.price + drift)
-        const decimals = p.symbol === 'ARB-USDC' || p.symbol === 'OP-USDC' ? 4 : p.symbol === 'SOL-USDC' ? 2 : p.symbol === 'ETH-USDC' ? 1 : 0
-        return { ...p, price: roundTo(price, decimals) }
-      })
-      return { ...state, pairs, uptimeSec: state.uptimeSec + 1 }
+      /*
+       * ★★ 这里原来在**凭空造行情**：`!state.live` 时用 `Math.random()` 让价格漂移
+       *   （`drift = (Math.random()-0.48) * price * 0.002`）。也就是说行情连不上时，
+       *   屏幕上会出现一条**随机游走的、看着完全正常的报价**，而它从源码里的
+       *   占位价出发 —— 用户看到的既不是真行情、也不是"没有行情"。
+       *   ⇒ 现在只维持运行时长。没有报价就是没有报价，由界面显示「—」并说明原因。
+       */
+      return { ...state, uptimeSec: state.uptimeSec + 1 }
     }
 
     case 'MARKET_SNAPSHOT': {
@@ -275,6 +303,9 @@ function reducer(state: State, action: Action): State {
 
     case 'SET_LIVE':
       return { ...state, live: action.live }
+
+    case 'SET_MARKET_SOURCE':
+      return { ...state, marketSource: action.source }
 
     case 'SET_KLINES':
       return { ...state, klines: { ...state.klines, [`${action.symbol}:${action.interval}`]: action.candles } }
@@ -350,7 +381,9 @@ function reducer(state: State, action: Action): State {
     }
 
     case 'SET_PAIR':
-      return { ...state, selectedPair: action.pair }
+      // ★ 只接注册表里有的标的。否则界面会被切到一个「没有行情的交易对」上，
+      //   而它与"行情还没推过来"长得一模一样 —— 拒绝比静默接受好排查（判据 13）。
+      return byInternal(action.pair) ? { ...state, selectedPair: action.pair } : state
 
     case 'TOGGLE_AGENT': {
       const updated = state.agents.map((a) =>

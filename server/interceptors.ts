@@ -54,6 +54,21 @@ export interface TradeDecision {
   takeProfitPrice?: number
   stopLossPrice?: number
   strategyId?: string
+  /**
+   * 用户**显式放弃**保护价（裸单）。缺省 `false`。
+   *
+   * ★★ 它在这里的唯一作用：告诉「真实盈亏比门禁」**这道门对这笔单不适用**，
+   *   于是那条腿报"没查"（`RR_NOT_CHECKED`）而**不是**"不合格"，管线**继续往下走**。
+   *
+   * ★ 为什么必须这样，而不能让它就地 `reject(GEOMETRY_MISSING)` 了事 ——
+   *   那是本条改造踩过的坑（实测）：`runPipeline` 是**短路**的，第一道不过就返回。
+   *   盈亏比门禁排在 order 50，它一 reject，后面 4 道（高周期顺势、ADX 震荡过滤、
+   *   置信度、日亏熔断）**一道都不会跑**，而 `checked` 只报 `5/9`。
+   *   结果是：一笔裸单拿到 `submitAllowed: true`，而**4 道真正的风险门根本没跑过、
+   *   也没有任何地方标出它们没跑**。那比"缺保护一律拒绝"危险得多 ——
+   *   它把"九道门"这个前提悄悄换成了"五道门"。
+   */
+  protectionWaived?: boolean
 }
 
 export interface InterceptorContext {
@@ -179,7 +194,27 @@ const BUILTIN_INTERCEPTORS: Interceptor[] = [
     check: (_pkg, decision) => {
       if (decision.action === 'WAIT') return PASS
       const { entryPrice: e, takeProfitPrice: t, stopLossPrice: s } = decision
-      if (e === undefined || t === undefined || s === undefined) {
+      // ★★ 裸单（用户显式放弃保护价）：这道门**不适用**，如实报"没查"并**放行继续**。
+      //
+      //   与下面那条 `GEOMETRY_MISSING` 的区别是**下一步动作**：
+      //     没豁免而缺三价 ⇒ 去把表单补全（这道门本来该跑，是输入不到位）；
+      //     显式豁免而缺保护 ⇒ 没有 R:R 可算，**不是错误**（用户选了裸单）。
+      //   合成一个 code 会让裸单收到一句"安全降级为 WAIT"，然后整条管线停在这里 ——
+      //   后面 4 道门一道不跑（见 `TradeDecision.protectionWaived` 的说明）。
+      //
+      //   ★ 刻意返回 `passed: true` + `code: 'RR_NOT_CHECKED'` 而不是某个"第三种结果"：
+      //     `runPipeline` 的结果结构只有"过/不过"，加第三种要动它的短路语义；
+      //     而"这道门没查"这件事由**消费方**（`tradeGate`）按 code 翻成 `notChecked` 腿 ——
+      //     于是原始 trail 里也是一句实话（`reason` 逐字说了没查），
+      //     而闸门裁决里它**永远不会**被算成通过。
+      if (t === undefined || s === undefined || e === undefined) {
+        if (decision.protectionWaived === true) {
+          return {
+            passed: true,
+            code: 'RR_NOT_CHECKED',
+            reason: '这笔单显式放弃保护价，没有盈亏比可算 —— 这道门**这次没查**，也没有参与放行',
+          }
+        }
         return reject('GEOMETRY_MISSING', '开仓报价缺少入场/止盈/止损三价之一，安全降级为 WAIT')
       }
       const check = validateQuoteGeometry({ action: decision.action, entry: e, takeProfit: t, stopLoss: s })

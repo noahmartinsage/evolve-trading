@@ -1,6 +1,7 @@
 import { createServer } from 'node:http'
 import { WebSocketServer } from 'ws'
 import { loadDotEnv, updateDotEnv } from './loadEnv.ts'
+import { INSECURE_DEFAULT_TOKEN, authzHint, createAuthGate, createDedupedNotifier } from './orchAuth.ts'
 import {
   cancelOrder,
   deactivateKillswitch,
@@ -15,20 +16,32 @@ import {
 } from './core.ts'
 import { getEvents, initLedger, eventCount, verifyMemoryChain, chainHead, appendEvent } from './ledger.ts'
 import { currentEquity, updateRiskConfig } from './risk.ts'
+import { gateInputFromOrderIntent, gateOrderForExecution, describeGateRefusal } from './orderGate.ts'
+import { markPriceOf } from './orchEngine.ts'
+import { getActiveLlm } from './llmProviders.ts'
+import { classifyKeyScope } from './keyScope.ts'
 import type { OrderIntentInput } from './risk.ts'
 import { liveGateway } from './gateway/executor.ts'
 import { isPersistent, persistSnapshot, queryEvents, getDb, claimInstance, heartbeatInstance, releaseInstance } from './persistence.ts'
 import { bindRetentionDb, startRetentionLoop } from './retention.ts'
 import { pipelineService } from './pipelineService.ts'
 import { computeEvidenceReceipt, evidenceCacheInfo, loadEvidence, warmEvidence } from './evidence.ts'
+import { auditIndexRows, checkGateReachable, factorIndexSummary, readFactorIndex, defaultIndexPath, produceFactors } from './factorService.ts'
+import {
+  defaultStrategyIndexPath,
+  factorStrategySummary,
+  readStrategyIndex,
+} from './factorStrategyService.ts'
+import { breadthSummary, defaultBreadthIndexPath, readBreadthIndex } from './breadthService.ts'
+import { forecast, forecastHeadline, parseForecastQuery } from './forecastService.ts'
 import { proposals } from './proposals.ts'
-import { listProviders, addProvider, removeProvider, probeAndPersist, setActiveModel, setEnabled, bindLlmProvidersDb } from './llmProviders.ts'
+import { listProviders, addProvider, removeProvider, probeAndPersist, setActiveModel, setEnabled, bindLlmProvidersDb, ensureEnvProvider } from './llmProviders.ts'
 import { routerConfigView } from './modelRouter.ts'
 import { OkxTestnetAdapter } from './venue/okxTestnet.ts'
 import { metrics } from './metrics.ts'
 import { verifyPersistedChain } from './audit.ts'
 import { generateProposals, measureFacts } from './proposalEngine.ts'
-import { evaluateSlo, checkAndAlert, SLO_TARGETS } from './slo.ts'
+import { evaluateSlo, checkAndAlert, SLO_TARGETS, lastAlertWebhook } from './slo.ts'
 import { surveillanceSnapshot } from './surveillance.ts'
 import { runInSandbox } from './sandbox/index.ts'
 import { runReconciliation, getLastReconciliation } from './reconciliation.ts'
@@ -48,8 +61,69 @@ import {
   ttsEngineView,
   synthesizeForVoice,
   missionGoalContext,
+  // 「聊过什么」的查阅出口（Task #114）。与 `handleUtterance` 同一个模块 ——
+  // 记的人和读的人必须看同一份事实源。
+  voiceTranscript,
+  voiceMemoryView,
 } from './voice/service.ts'
+// ── 手机端远程指挥（Telegram）─────────────────────────────────────────
+// ★ 只从这里取**搬运**用的四个名字，没有一个是"顺手加的能力"：
+//   `startTelegramPolling` 只负责去拉消息，消息交回 `handleUtterance`。
+//   本模块里没有任何下单/风控逻辑，也不许有（红线②：它不是一个新通道）。
+import {
+  allowChat as allowTelegramChat,
+  revokeChat as revokeTelegramChat,
+  startTelegramPolling,
+  stopTelegramPolling,
+  telegramView,
+} from './voice/telegram.ts'
 import { missionStatusView, planMission, startMissionByPlan } from './mission/service.ts'
+// 附件是**一轮对话的载荷**：类型定义在语音层，因为它只在这条链路上流动。
+import type { RawAttachment } from './voice/attachments.ts'
+// ── Agent 舰队 ────────────────────────────────────────────────────────
+// 只从 `server/fleet/index.ts` 取（那一层是唯一对外面）。**七个名字一一对应
+// 七个真实动作**，没有一个是"留着以后用"的占位 —— 占位 import 会让
+// "这个能力有生产入口吗"这个问题得到一个看着像"有"的答案。
+import {
+  ensureFleetInstalled,
+  fleetSnapshot,
+  fleetRoster,
+  runAgent,
+  runTask,
+  renderTaskBrief,
+  planTask,
+  FLEET_TASK_PLANS,
+  FLEET_TOPICS,
+  FLEET_CONSUMERS,
+  autonomyStatus,
+  autonomyTicks,
+  autostartAutonomy,
+  AUTONOMY_JOBS,
+  // 新闻雷达（第十八轮）：`latestDigest` 是那个只读端点的唯一数据来源。
+  latestDigest,
+  KEEP_THRESHOLD,
+  NEWS_SOURCES,
+  RELEVANCE_TERMS,
+  // 新闻雷达的**推送面与闭环**（第十八轮第二批）：
+  //   trending / universe 是雷达唯一接回系统行为的那根线（breadth 取候选）；
+  //   proposalRows / pending* 是"人对提案拍板"这条链的读数；
+  //   appendNewsVerdict 是裁决的唯一落盘出口。
+  readTrending,
+  suggestedUniverse,
+  proposalRows,
+  pendingProposalCount,
+  pendingSpeech,
+  appendNewsVerdict,
+  // `readLastRun` 是各源战绩的**唯一**来源。原来这里从 `NEWS_DIGEST` 事件取，
+  // 而事件活在进程内存里 —— 编排器一重启，面板就把所有源显示成「0 条」，
+  // 与"源真的什么都没拿到"长得一样（判据 24）。实测踩过，改成读落盘报告。
+  readLastRun,
+} from './fleet/index.ts'
+import type { SourceReport } from './fleet/index.ts'
+// 账号池现状**直接来自池子本身**，不从舰队那一层转手 —— 它不是舰队的成员，
+// 而是所有成员共用的那条通道。启动器与控制台都要读它，而"还有几个账号能用"
+// 这件事只有一个真相来源（判据 8：同一件事不给第二条实现路径）。
+import { poolSnapshot } from './llmPool.ts'
 import { SandboxAdapter } from './venue/sandbox.ts'
 import { CexTestnetAdapter } from './venue/cexTestnet.ts'
 import type { VenueAdapter, BalanceSnapshot } from './venue/types.ts'
@@ -99,8 +173,26 @@ import {
 import type { PolicyUnit } from './policySnapshot.ts'
 import { auditSnapshotObservability, isSampleQualitySufficient, renderObservabilityBrief, OBSERVABILITY_LABEL, OBSERVABILITY_HINT } from './decisionObservability.ts'
 import { installCrashGuard } from './crashGuard.ts'
+import { HEALTH_ROLE_FIELD, type ServiceRole } from './serviceIdentity.ts'
+import {
+  UI_PAGES,
+  UI_ACTIONS,
+  claimPendingTasks,
+  completeUiAction,
+  enqueueUiAction,
+  listTasks,
+  renderQueueSpeech,
+  setUiWorkspaceRoot,
+  uiWorkspaceRoot,
+} from './uiActions.ts'
 
 loadDotEnv()
+
+// ★ 界面动作队列的工作区根**只在这里定一次**。
+//   语音层（它按同一份队列排动作）走 `uiWorkspaceRoot()` 读这个值 ——
+//   两边各自调一次 `process.cwd()` 就等于把"它们是不是同一份队列"交给运气，
+//   而表现是"桌宠说排了、界面说队列是空的"，两边单独看都没错。
+setUiWorkspaceRoot(process.cwd())
 
 // ★ 遗言机制，尽量排在最前面：本文件是纯主模块（没有任何脚本 import 它），
 //   所以这里挂 handler 不会污染测试进程。挂在 loadDotEnv 之后、
@@ -120,11 +212,13 @@ const REST = process.env.BINANCE_REST ?? 'https://data-api.binance.vision'
 const ALLOWED_ORIGIN = process.env.ORCH_ALLOWED_ORIGIN ?? '*'
 
 // 密钥治理（C6）：生产环境必须显式提供令牌，fail-closed 拒绝启动
-if (process.env.NODE_ENV === 'production' && (!process.env.ORCH_TOKEN || process.env.ORCH_TOKEN === 'dev-insecure-token')) {
+// ★ 默认令牌那个字符串**只住在 `server/orchAuth.ts` 里**（判据 ⑯）——
+//   以前它在本文件里出现三遍，改一处必漏一处。
+if (process.env.NODE_ENV === 'production' && (!process.env.ORCH_TOKEN || process.env.ORCH_TOKEN === INSECURE_DEFAULT_TOKEN)) {
   console.error('❌ NODE_ENV=production 要求显式设置 ORCH_TOKEN')
   process.exit(1)
 }
-const TOKEN = process.env.ORCH_TOKEN ?? 'dev-insecure-token'
+const TOKEN = process.env.ORCH_TOKEN ?? INSECURE_DEFAULT_TOKEN
 
 function json(res: import('node:http').ServerResponse, code: number, body: unknown): void {
   const data = JSON.stringify(body)
@@ -132,8 +226,39 @@ function json(res: import('node:http').ServerResponse, code: number, body: unkno
   res.end(data)
 }
 
+/**
+ * "有人带着公开默认令牌从**别的设备**来敲门" —— 这件事必须留痕。
+ *
+ * ★ 去重与有界住在 `createDedupedNotifier` 里（判据 C7 的反面：不去重的话
+ *   一次端口扫描就能把账本写成几万行、把真正的事件挤出去）。
+ * ★ 只记来源地址，**不复述令牌**（那一格说的是"有人试过"，不是"口令是 X"）。
+ * ★ 包在 try 里：记账失败**不许**改变鉴权结论 —— 那会变成"账本坏了就放行"。
+ */
+const noteInsecureRemoteOnce = createDedupedNotifier({
+  max: 32,
+  emit: (key) => {
+    try {
+      appendEvent('ORCH_REMOTE_WITH_DEFAULT_TOKEN', {
+        remote: key,
+        hint: authzHint('insecure-remote'),
+      })
+    } catch {
+      /* 记账失败不改判 */
+    }
+  },
+})
+
+/**
+ * **谁能通过它下指令。规矩只有这一条**（二十多个端点共用它，
+ * 所以改一处即全站生效；判据本身住在 `server/orchAuth.ts`，账本服务用的是同一份）。
+ *
+ * ★ 这里只剩"把请求翻译成判据的入参"这一件事。任何一条业务判断都**不许**
+ *   再写回来 —— 那正是它当初变成两份副本、且"接线可达"只能靠读源码去验的原因。
+ */
+const authGate = createAuthGate({ token: TOKEN, onInsecureRemote: noteInsecureRemoteOnce })
+
 function authorized(req: import('node:http').IncomingMessage): boolean {
-  return req.headers['x-orch-token'] === TOKEN
+  return authGate(req.headers['x-orch-token'], req.socket.remoteAddress)
 }
 
 async function readBody(req: import('node:http').IncomingMessage): Promise<string> {
@@ -161,7 +286,17 @@ const httpServer = createServer(async (req, res) => {
   try {
     if (url.pathname === '/healthz') {
       const s = getOrchState()
-      return json(res, 200, { ok: true, uptimeSec: Math.floor((Date.now() - startedAt) / 1000), killswitch: s.killswitch, mode: s.mode })
+      // ★ `[HEALTH_ROLE_FIELD]`：**「你是谁」是这个端点最要紧的一格**。
+      //   同一个端口上可能有别人的服务（本机实测：隔壁工作区的 dash 服务占着
+      //   127.0.0.1:8790）。少了这一格，启动器就只能用"HTTP 有响应"当判据 ——
+      //   那会**认错人**，而且错得完全看不出来（见 stackCore 里那段注释）。
+      return json(res, 200, {
+        ok: true,
+        [HEALTH_ROLE_FIELD]: 'orch' satisfies ServiceRole,
+        uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
+        killswitch: s.killswitch,
+        mode: s.mode,
+      })
     }
 
     if (url.pathname === '/state') {
@@ -191,12 +326,146 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/orders') {
       if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
       const intent = JSON.parse(await readBody(req)) as OrderIntentInput & { mode?: 'paper' | 'live'; strategyId?: string }
+
+      // ── 出单前**必须**过一次闸门 ────────────────────────────────────────
+      //
+      // ★ 在 `orderGate.ts` 出现之前，这个端点**一道闸门都不过**：交易大厅会先
+      //   问一次 `/orders/precheck`（只读），而这条**真正出单**的路从来不问。
+      //   于是"闸门"只挡得住愿意先问一声的人 —— 判据 8 的典型形态。
+      //   现在三条出单路（自治循环 / 这里 / 语音）走的是**同一次调用的同一份结果**。
+      //
+      // ★ 平仓单**不适用**开仓闸门：闸门守的是"要不要新增一笔风险"。
+      //   但 `OrderIntentInput` 目前**没有** `reduceOnly` 字段 ⇒ 这里识别不了平仓。
+      //   已知代价（必须说出来）：若有调用方拿它平仓，会被闸门拦，而平仓本该随时可做。
+      //   真要用它平仓，先给 `OrderIntentInput` 加 `reduceOnly` 再在下面放行 ——
+      //   在那之前**宁可拦错也不放错**（每一次裁决都有 `ORDER_GATE` 留痕，可复盘）。
+      const s0 = getOrchState()
+      const env: 'paper' | 'live' = intent.mode === 'live' ? 'live' : 'paper'
+      const mark = markPriceOf(s0, intent.symbol)
+      const gi = gateInputFromOrderIntent(intent, { environment: env, mark })
+      if (!gi.ok) {
+        // ★ 闸门没跑起来 ⇒ 不会有 `ORDER_GATE` 留痕，所以这一条必须在这里记。
+        appendEvent('ORDER_GATE_REFUSED', {
+          symbol: intent.symbol,
+          side: intent.side,
+          reason: gi.reason,
+          stage: 'gate-input',
+        })
+        return json(res, 422, { ok: false, clientOrderId: intent.clientOrderId, reason: gi.reason })
+      }
+      const gate = await gateOrderForExecution(gi.req, { source: 'orders' })
+      if (!gate.submitAllowed) {
+        return json(res, 422, {
+          ok: false,
+          clientOrderId: intent.clientOrderId,
+          reason: gate.summary,
+          verdict: gate.verdict,
+          blockers: gate.blockers.map((b) => b.id),
+          pipeline: gate.pipeline,
+          // ★ 拒绝要**说清是哪一道门**并带上**可照做的数字**（判据 D7）——
+          //   只回一句"被风控拒绝"会把人引向"那我再点一次"，而那个动作没有用。
+          detail: describeGateRefusal(gate),
+        })
+      }
+
       if (intent.mode === 'live') {
         const outcome = await processLiveIntent({ ...intent, strategyId: intent.strategyId ?? '' })
         return json(res, outcome.ok ? 200 : 422, outcome)
       }
       const outcome = processOrderIntent(intent)
       return json(res, outcome.ok ? 200 : 422, outcome)
+    }
+
+    // ── 下单预检：把「这笔交易凭什么可以出去」在**下单之前**回答掉 ────────
+    //
+    // ★ 这个端点存在的唯一理由：交易大厅（人工下单）原先**一道闸门都不过**，
+    //   而自治循环（机器下单）过全部 9 道。同一个业务动作两条路径，
+    //   且人那条从来没有任何测试覆盖 —— 判据 8 的典型形态。
+    //
+    // ★ 它是 `runPipeline` 的**第二个生产入口**，不是第二份实现：
+    //   判断全在 `tradeGate.precheckTrade()`，那里只是编排既有模块。
+    //   只读语义：不改状态、不占台账、不写审批单。
+    if (req.method === 'POST' && url.pathname === '/orders/precheck') {
+      const body = JSON.parse(await readBody(req)) as {
+        symbol?: string
+        side?: string
+        notionalUsdt?: number
+        entry?: number
+        takeProfit?: number
+        stopLoss?: number
+        confidence?: number
+        channel?: string
+        venue?: string
+        expectedEdgeBps?: number
+        holdingHours?: number
+        markPrice?: number
+        refresh?: boolean
+        /**
+         * 这笔单是否**声称以走势预测为依据**（见 `tradeGate.ForecastClaim`）。
+         *
+         * ★ 请求体里**只接受这个布尔**，不接受预测结论本身 ——
+         *   结论由 `precheckLiveTrade()` 内部现算。允许调用方传结论，
+         *   等于把"依据"交给被审的那一方自己开（`file_lesson` 那条凭据纪律同源）。
+         */
+        forecastClaims?: boolean
+        forecastHorizonMinutes?: number
+        /**
+         * 用户**显式放弃**保护价（裸单）。缺省 `false`。
+         * ★ 缺省必须是 `false`：把"没给保护价"自动读成"用户不要保护"，
+         *   会让任何一次调用方漏填静默降级成裸单放行（见 `tradeGate.PrecheckInput`）。
+         */
+        protectionWaived?: boolean
+        /** 生效杠杆（已被 `judgeLeverage` 裁决过）。裸单的合约单必填。 */
+        leverage?: number
+        instType?: 'SPOT' | 'SWAP'
+      }
+      if (!body.symbol) return json(res, 400, { error: 'MISSING_SYMBOL' })
+      if (body.side !== 'buy' && body.side !== 'sell') return json(res, 400, { error: 'BAD_SIDE' })
+
+      const s = getOrchState()
+      const environment: 'paper' | 'live' = s.mode === 'live' ? 'live' : 'paper'
+      const bodyEnv = (body as { environment?: string }).environment
+      const env: 'paper' | 'live' = bodyEnv === 'live' || bodyEnv === 'paper' ? bodyEnv : environment
+
+      // ★ 闸门走**唯一入口** `orderGate.ts` —— 与 `/orders`、与语音是**同一次调用的
+      //   同一份结果**。原先这里 inline 了一份 deps 与一次 `precheckLiveTrade(...)`，
+      //   于是闸门在服务端有了两个调用面：这个端点问一句，而真正出单的那条路不问。
+      //   判据 8：一个业务动作一条实现路径 —— 收口到一处。
+      const result = await gateOrderForExecution(
+        {
+          symbol: body.symbol,
+          side: body.side,
+          notionalUsdt: Number(body.notionalUsdt ?? 0),
+          entry: Number(body.entry ?? 0),
+          takeProfit: Number(body.takeProfit ?? 0),
+          stopLoss: Number(body.stopLoss ?? 0),
+          ...(body.confidence === undefined ? {} : { confidence: Number(body.confidence) }),
+          environment: env,
+          channel: body.channel === 'dex' ? 'dex' : 'cex',
+          ...(typeof body.venue === 'string' && body.venue ? { venue: body.venue } : {}),
+          ...(body.expectedEdgeBps === undefined ? {} : { expectedEdgeBps: Number(body.expectedEdgeBps) }),
+          ...(body.holdingHours === undefined ? {} : { holdingHours: Number(body.holdingHours) }),
+          ...(body.markPrice === undefined ? {} : { markPrice: Number(body.markPrice) }),
+          refresh: body.refresh === true,
+          forecastClaims: body.forecastClaims === true,
+          ...(body.forecastHorizonMinutes === undefined
+            ? {}
+            : { forecastHorizonMinutes: Number(body.forecastHorizonMinutes) }),
+          // ★ `=== true`（不是 `?? false` 也不是真假值转换）：豁免只认**布尔真**，
+          //   字符串 "false" / 数字 1 一律不算 —— 凭据只由一个明确的表态产生。
+          protectionWaived: body.protectionWaived === true,
+          ...(body.leverage === undefined ? {} : { leverage: Number(body.leverage) }),
+          ...(body.instType === 'SWAP' || body.instType === 'SPOT' ? { instType: body.instType } : {}),
+        },
+        { source: 'precheck' },
+      )
+
+      // 留痕：预检是**只读**的，但它必须可核 —— 否则「当时闸门到底怎么判的」
+      // 又变成只能靠界面上那一眼（判据 C1 的另一半：有端点 ≠ 有人读；有人读 ≠ 有据可查）。
+      // ★ 记在 `orderGate.ts` 里（`source: 'precheck'` ⇒ 事件名仍是 `ORDER_PRECHECK`），
+      //   段留痕代码与 `/orders`、与语音共用同一份。这里**不再自己记一遍**：
+      //   同一件事两个主人，改一处不会让另一处报错（红线 ⑯）。
+      return json(res, 200, result)
     }
 
     if (req.method === 'DELETE' && url.pathname.startsWith('/orders/')) {
@@ -317,6 +586,109 @@ const httpServer = createServer(async (req, res) => {
       return json(res, 200, result)
     }
 
+    // ── 因子批量生产线 ────────────────────────────────────────────────
+    // 与 /proposals/generate 是两条独立的产线：那条产"策略"（含仓位成本），
+    // 这条产"因子"（纯信号，只问有没有预测力）。分开是为了能做归因：
+    // "信号没用"和"信号有用但被成本吃掉"必须能被区分开。
+    if (url.pathname === '/factors/index' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const { index, damaged } = readFactorIndex(defaultIndexPath())
+      const summary = factorIndexSummary()
+      // 面板要能逐行标出"这行的判决已经过时"，所以除了概况还要两个**逐行**的判据：
+      //   · `inconsistentSlugs` —— 判决与自己记下的指标自相矛盾的行（判定器升级遗留）；
+      //   · `currentDataHash`   —— 当前行情的指纹。台账行自带 `dataHash`，
+      //     两者一比就知道这一行的结论是不是在**别的一份行情**上做出的。
+      // 少了后一个，面板只能显示一个 12 位十六进制串 —— 那对用户等于没显示。
+      const currentDataHash = loadEvidence('BTCUSDT', 15).dataHash
+      return json(res, 200, {
+        ok: damaged === null,
+        damaged,
+        summary,
+        currentDataHash,
+        inconsistentSlugs: auditIndexRows(index).map((x) => x.slug),
+        index,
+      })
+    }
+
+    // 策略层台账（因子 → 可交易策略这一步的结论）。
+    // 与 /factors/index 是**上下游两层**：上一层回答"这个信号有没有预测力"，
+    // 这一层回答"它扣掉成本与滑点之后还赚不赚钱"。两层分开是刻意的 ——
+    // 合成一个数字就再也分不清"信号没用"和"信号有用但被成本吃掉"。
+    if (url.pathname === '/factors/strategies' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const { index, damaged } = readStrategyIndex(defaultStrategyIndexPath())
+      const summary = factorStrategySummary()
+      return json(res, 200, { ok: damaged === null, damaged, summary, index })
+    }
+
+    // 横截面（breadth）台账 —— 因子线的第三层。
+    // 三层的关系：/factors/index 问"信号有没有预测力" → /factors/strategies 问
+    // "扣掉成本还赚不赚钱" → 这一层问"**换到一批标的上做排序**，毛与成本谁大"。
+    // 第三层存在的理由：前两层测出来的「每笔毛边际 vs 每笔成本」差 12~40 倍，
+    // 而横截面是唯一还没被真正跑过的那条路（多空对冲消掉市场方向、
+    // 每个时刻有 N 个样本而不是 1 个）。
+    if (url.pathname === '/breadth/index' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const { index, damaged } = readBreadthIndex(defaultBreadthIndexPath())
+      const summary = breadthSummary()
+      // 面板事实与逐行结论**一起**返回：一条"通过"如果不知道自己在哪些品种、
+      // 哪段时间、哪个 horizon 上得出的，它就不能被复核，也不能在数据变化后作废。
+      // 与 /factors/index 返回 currentDataHash 是同一个立场。
+      return json(res, 200, { ok: damaged === null, damaged, summary, index })
+    }
+
+    // 走势预测 —— 桌宠问「帮我预测一下比特币未来一小时的走势」时走这里。
+    //
+    // ★ 它是**只读**的：不落盘、不下单、不改任何状态。要不要下单由既有的
+    //   `POST /orders/precheck`（交易闸门）决定 —— 预测只产出证据与裁决，
+    //   判据 8：同一个业务动作（下一笔单）只许有一条路径。
+    // ★ 它**永远带 `outcome` 与 `calibration`**：`no-edge` 时也照样返回方向与价位，
+    //   但把"命中率与平凡规则分不开"这句话一起返回。少这一句，接口就在教用户
+    //   把噪声当信号（`headline` 里也带同一句，两处同源）。
+    if (url.pathname === '/forecast' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      /*
+       * ★ 参数怎么读、拒哪些，全部归 `parseForecastQuery` —— 那是个**纯函数**，
+       *   所以门禁（`test:forecast` F8）能直接钉住"分辨率不许调用方自报"这条红线。
+       *   写在端点里的话，断言就得先起一个 HTTP 服务：那是"只有测试可达"的
+       *   反面 —— **不可测的东西等于没被钉住**。
+       */
+      const parsed = parseForecastQuery(url.searchParams)
+      if (!parsed.ok) return json(res, parsed.status, { error: parsed.error, message: parsed.message })
+      const { symbol, horizon } = parsed
+      const result = forecast({
+        symbol,
+        config: { horizonBars: horizon.horizonBars, barMinutes: horizon.barMinutes },
+      })
+      // ★ `horizon` 一起返回：调用方从响应里就能读回"你要的 5 分钟被并成了 15 分钟"，
+      //   而不必从 `barMinutes × horizonBars` 反算（反算的口径未必与这里相同）。
+      return json(res, 200, { ok: true, headline: forecastHeadline(result), horizon, result })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/factors/generate') {      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const body = (await readBody(req).then((t) => (t ? JSON.parse(t) : {})).catch(() => ({}))) as {
+        count?: number
+        symbol?: string
+        dryRun?: boolean
+      }
+      // 刻意不接受 body 里的 thresholds：阈值只能来自代码里的唯一出处。
+      // 允许请求体传阈值 = 把"证据门槛"交给调用方，那等于门可以自己开。
+      const r = produceFactors({ count: body.count, symbol: body.symbol, dryRun: body.dryRun })
+      return json(res, 200, {
+        origin: r.origin,
+        dataHash: r.dataHash,
+        bars: r.bars,
+        specs: r.specs,
+        accepted: r.accepted,
+        rejected: r.rejected,
+        unverifiable: r.unverifiable,
+        byGate: r.byGate,
+        indexPath: r.indexPath,
+        written: r.written,
+        rows: r.rows,
+      })
+    }
+
     // LLM 厂商注册表（C-6/E5：自定义厂商 + 自动识别可用模型）
     if (url.pathname === '/llm/providers' && req.method === 'GET') {
       return json(res, 200, { providers: listProviders() })
@@ -407,7 +779,11 @@ const httpServer = createServer(async (req, res) => {
 
     if (url.pathname === '/slo') {
       const evaluation = evaluateSlo(metrics.snapshot({ gateway: liveGateway.status(), eventMemoryCount: eventCount() }))
-      return json(res, 200, { targets: SLO_TARGETS, ...evaluation })
+      // ★ 告警通道的状态必须有一个**有人读**的出口（监控页的 SLO 面板在轮询它）。
+      //   这条通道坏掉之后，外表与"系统一直很健康"完全一样 —— 两种情形都是
+      //   "屏幕上没有任何告警"。`null` = 从没触发过告警，与"配好了、发得出去"
+      //   是两件不同的事，不许显示成同一种样子（判据 C7/D7）。
+      return json(res, 200, { targets: SLO_TARGETS, ...evaluation, alertWebhook: lastAlertWebhook() })
     }
 
     if (req.method === 'POST' && url.pathname === '/slo/check') {
@@ -1056,6 +1432,318 @@ const httpServer = createServer(async (req, res) => {
       })
     }
 
+    // ── Agent 舰队 ────────────────────────────────────────────────────
+    // 在这一段出现之前，`server/fleet/**` 有 1938 行实现、**零个调用方** ——
+    // 那是本项目里最贵的一类缺陷：逻辑正确、有断言、跑得通，但没有任何生产
+    // 路径会走到它（判据 11）。这几个端点就是它的"生产入口"。
+    //
+    // 全部要求令牌：舰队实况里含文件体检员的**绝对路径清单**，
+    // 那不是可以随便给人看的量。
+    if (url.pathname === '/fleet' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      return json(res, 200, {
+        snapshot: fleetSnapshot(),
+        roster: fleetRoster(),
+        // 通道现状：**"还有几个账号能用"必须能被问出来**，否则用户没法判断
+        // "系统不动了"是坏了还是额度爆了（判据 13：这两种事指向相反的动作）。
+        pool: poolSnapshot(),
+        topics: FLEET_TOPICS,
+        consumers: FLEET_CONSUMERS,
+        // 「能听懂哪些说法」必须能**被问出来**。用户实测反馈是
+        // "扩候选基因空间和换因子族等都听不懂" —— 一个既听不懂也说不清
+        // 自己能听懂什么的助手，用户没有任何办法把它用起来。
+        plans: FLEET_TASK_PLANS.map((p) => ({ id: p.id, label: p.label, chain: p.chain, why: p.why })),
+      })
+    }
+
+    // 只做"这句话我能不能接"的判定，**不执行**。语音层要在跑之前先问一句，
+    // 否则用户会看到系统先动起来、再被拒绝。
+    if (url.pathname === '/fleet/plan' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const body = await readBody(req).then((t) => (t ? JSON.parse(t) : {})).catch(() => ({})) as { goal?: string }
+      const r = planTask(String(body.goal ?? ''))
+      return json(res, 200, { ok: r.plan !== null, plan: r.plan ? { id: r.plan.id, label: r.plan.label, chain: r.plan.chain } : null, why: r.why })
+    }
+
+    if (url.pathname === '/fleet/run' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const body = await readBody(req).then((t) => (t ? JSON.parse(t) : {})).catch(() => ({})) as {
+        agentId?: string
+        arg?: string
+        confirmed?: boolean
+        dryRun?: boolean
+      }
+      // ★ `confirmed` 与 `dryRun` **必须原样透传**，不能在这里给默认值：
+      //   `runAgent` 靠 `confirmed !== true` 决定要不要拒。若这里写
+      //   `confirmed: body.confirmed ?? true`，act 类成员就永远拒不了了 ——
+      //   而那正是"用户没确认却改了系统状态"这条红线的唯一实现。
+      const receipt = await runAgent(String(body.agentId ?? ''), {
+        arg: body.arg,
+        confirmed: body.confirmed === true,
+        dryRun: body.dryRun === true,
+      })
+      return json(res, receipt.ok ? 200 : 422, receipt)
+    }
+
+    if (url.pathname === '/fleet/task' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const body = await readBody(req).then((t) => (t ? JSON.parse(t) : {})).catch(() => ({})) as {
+        goal?: string
+        confirmed?: boolean
+        dryRun?: boolean
+      }
+      const receipt = await runTask(String(body.goal ?? ''), {
+        confirmed: body.confirmed === true,
+        dryRun: body.dryRun === true,
+      })
+      return json(res, receipt.ok ? 200 : 422, { ...receipt, brief: renderTaskBrief(receipt) })
+    }
+
+    // ── 自治循环的现状（只读）─────────────────────────────────────────
+    //
+    // ★ 启停**不在这里**：它们走 `POST /fleet/task`（goal=「一键启动自治循环」/
+    //   「停止自治循环」）。给启停单开端点就是给同一件事造第二条实现路径 ——
+    //   而两条路径迟早对同一件事给出不同的确认与文案（判据 8）。
+    //   需要这个只读端点，是因为**状态与排程时刻无法从别处得到**：
+    //   `runTask` 的凭据里只有"这一次"的结果，没有"下一次什么时候"。
+    if (url.pathname === '/fleet/autonomy' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const st = autonomyStatus()
+      return json(res, 200, {
+        status: st,
+        jobs: AUTONOMY_JOBS.map((j) => ({ id: j.id, label: j.label, everyMs: j.everyMs, goal: j.goal, why: j.why, reversible: j.reversible })),
+        // 循环自己干过活的取证：从**账本**读，不读内存计数器 ——
+        // 进程重启后计数器归零，而账本不会。
+        ticks: autonomyTicks(30),
+        // 「哪些说法能承接」必须能被问出来（与 /fleet 的 plans 同一理由）。
+        plans: FLEET_TASK_PLANS.map((p) => ({ id: p.id, label: p.label, chain: p.chain, writes: p.writes })),
+      })
+    }
+
+    // ── 新闻雷达（只读）────────────────────────────────────────────────
+    //
+    // ★ 它只**读**：真正的抓取与内化走 `POST /fleet/task`（goal 被 `news` 计划接住）。
+    //   与 `/fleet/autonomy` 同一条纪律 —— 同一件事不给第二条实现路径。
+    //   这个端点存在的理由是"**最近读到了什么**"这个问题没有别的出口：
+    //   账本里有 `NEWS_DIGEST` 事件，但没有条目正文与命中词。
+    if (url.pathname === '/fleet/news' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
+      const items = latestDigest(process.cwd(), limit)
+      const events = getEvents(0)
+      const recent = events
+        .filter((e) => e.kind === 'NEWS_DIGEST' || e.kind === 'NEWS_INTERNALIZED' || e.kind === 'NEWS_PROPOSAL_VERDICT')
+        .slice(-10)
+        .map((e) => ({ at: e.ts, kind: e.kind, payload: e.payload }))
+
+      // ── 来源情报（内化自 nlp3 的 Source Intelligence）──────────────────
+      // 每个源各自的战绩：抓了几条、有几条过门、平均分多少。
+      // ★ 这一块不是为了好看 —— 它回答的是"哪个源该留、哪个源该换词"，
+      //   也就是**让雷达能改进自己**的唯一依据。少了它，源清单就没人敢动。
+      // ★★ 数据来自**落盘的那份运行报告**（`data/news/last-run.json`），
+      //   不是进程内存里的事件。理由是实测出来的：事件活在内存里，编排器一重启就没了，
+      //   面板会把 5 个源全画成「0 条」—— 而 0 是个**合法数字**，
+      //   与"源真的什么都没拿到"长得一模一样，两者的下一步却完全相反（判据 24）。
+      //   读不到就给 `null`，让界面说"还没跑过一轮"，而不是替它编一个 0
+      //   （判据 13：读路径静默陈旧最危险 —— 下游会一起失效且看着还对）。
+      const run = readLastRun(process.cwd())
+      const fromRun = new Map<string, SourceReport>()
+      for (const s of run?.sources ?? []) fromRun.set(s.source, s)
+      const srcStat = new Map<
+        string,
+        { id: string; label: string; ok: boolean | null; got: number | null; kept: number; scoreSum: number }
+      >()
+      for (const s of NEWS_SOURCES) {
+        const r = fromRun.get(s.id)
+        srcStat.set(s.id, { id: s.id, label: s.label, ok: r?.ok ?? null, got: r?.got ?? null, kept: 0, scoreSum: 0 })
+      }
+      // 报告里有、而当前源清单里没有的源：**照实画出来**。
+      // 悄悄丢掉它等于把"这个源上一轮还在用"这件事抹掉，而源清单的增删
+      // 正是靠这一栏判断的。
+      for (const [id, r] of fromRun) {
+        if (!srcStat.has(id)) srcStat.set(id, { id, label: id, ok: r.ok, got: r.got, kept: 0, scoreSum: 0 })
+      }
+      for (const it of items) {
+        const hit = [...srcStat.values()].find((s) => s.label === it.source)
+        if (!hit) continue
+        if (it.score >= KEEP_THRESHOLD) hit.kept += 1
+        hit.scoreSum += it.score
+      }
+
+      const trend = readTrending(process.cwd())
+      const uni = suggestedUniverse(process.cwd())
+      return json(res, 200, {
+        latest: items,
+        // 每条都带 `matched` 与 `reasons`：面板要能回答"**为什么**觉得这条相关"。
+        threshold: KEEP_THRESHOLD,
+        sources: NEWS_SOURCES.map((s) => ({ id: s.id, label: s.label, kind: s.kind, why: s.why })),
+        sourceStats: [...srcStat.values()].map((s) => ({
+          ...s,
+          // 分母优先用"这一轮抓了几条"（有报告时），没有报告就退回"几条过门"。
+          // ★ 不写 `?? 0` —— null 会静默变成"平均 0 分"，那是个看着正常的错值。
+          avgScore: Number((s.scoreSum / Math.max(1, s.got ?? s.kept)).toFixed(1)),
+        })),
+        terms: RELEVANCE_TERMS.map((t) => ({ term: t.term, weight: t.weight, why: t.why })),
+        // 品种热度：这是雷达接回系统行为的那根线（breadth 的候选清单）。
+        trending: trend ? { at: trend.at, ticks: trend.ticks } : null,
+        universe: uni,
+        proposals: proposalRows(process.cwd()).slice(-30).reverse(),
+        pending: pendingProposalCount(process.cwd()),
+        pendingSpeech: pendingSpeech(process.cwd()),
+        // 「立即跑一轮」要用的那句话 = 自治循环里 news_watch 那一项的 goal。
+        // ★ 不让界面自己拼：拼出来的目标与定时跑的目标就不是同一件事了，
+        //   而两者长得一模一样（判据 8：同一件事不给第二条实现路径）。
+        //   `?? ''` 而不是给个默认句子 —— 空串会让界面把按钮画成不可用，
+        //   而不是偷偷跑一个"自己编的目标"。
+        runGoal: AUTONOMY_JOBS.find((j) => j.id === 'news_watch')?.goal ?? '',
+        recentEvents: recent,
+        // 最近一轮的**报告**（各源战绩 + 那个时刻）。
+        // ★ `null` = 这个工作目录还从来没跑过一轮 —— 界面必须把它与
+        //   "跑了但全是 0"分开画，否则第一次打开面板的人会把"没有数据"
+        //   读成"新闻源全挂了"。
+        lastRun: run
+          ? { at: run.at, fetched: run.fetched, kept: run.kept, fresh: run.fresh, speech: run.speech }
+          : null,
+      })
+    }
+
+    // 人对内化提案拍板（确认 / 驳回）。
+    //
+    // ★ 为什么是两段式（`confirmed` 必须显式为 true）：与舰队 `act` 类成员同一条红线 ——
+    //   这是一次**治理动作**，会被写进账本。一次点击就落的裁决等于没有留痕。
+    // ★ 裁决**只写不放行**：它不改任何交易状态、不放松任何门限。
+    //   它记下"人看过这条提案了、这么判的"，仅此而已。
+    if (url.pathname === '/fleet/news/verdict' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const raw = await readBody(req)
+      let body: { noteId?: unknown; index?: unknown; decision?: unknown; why?: unknown; by?: unknown; confirmed?: unknown }
+      try {
+        body = JSON.parse(raw) as typeof body
+      } catch {
+        return json(res, 400, { error: 'INVALID_JSON' })
+      }
+      const noteId = String(body.noteId ?? '')
+      const index = Number(body.index ?? NaN)
+      const decision = String(body.decision ?? '')
+      const why = body.why
+      const by = String(body.by ?? 'operator').slice(0, 40)
+      if (decision !== 'approve' && decision !== 'reject') {
+        return json(res, 400, { error: 'BAD_DECISION', note: 'decision 只能是 approve 或 reject' })
+      }
+      if (body.confirmed !== true) {
+        return json(res, 422, {
+          error: 'NEEDS_CONFIRMATION',
+          note: '这是一次治理动作，会写进账本与 data/news/verdicts.jsonl —— 需要 confirmed:true 才落',
+        })
+      }
+      // 提案必须真的存在。凭一个不存在的编号写裁决，等于往留痕里塞幽灵。
+      const exists = proposalRows(process.cwd()).some((r) => r.noteId === noteId && r.index === index)
+      if (!exists) {
+        return json(res, 404, { error: 'NO_SUCH_PROPOSAL', note: `提案单里没有 ${noteId}#${index}` })
+      }
+      try {
+        const p = appendNewsVerdict(process.cwd(), {
+          noteId,
+          index,
+          decision,
+          at: Date.now(),
+          by,
+          why: typeof why === 'string' && why.trim() ? why.trim().slice(0, 400) : null,
+        })
+        return json(res, 200, {
+          ok: true,
+          writtenTo: p,
+          decision,
+          pending: pendingProposalCount(process.cwd()),
+          speech: pendingSpeech(process.cwd()),
+        })
+      } catch (e) {
+        return json(res, 400, { error: 'BAD_VERDICT', note: e instanceof Error ? e.message : String(e) })
+      }
+    }
+
+    // ── UI 动作通道（桌宠/语音 → 界面按钮）────────────────────────────────
+    //
+    // 这一组端点的**消费者是界面自己**：界面每 2 秒来取一次"有没有人要你按什么"，
+    // 按完把结果报回去。于是"桌宠说按一下"与"人手点一下"落到同一个 DOM 元素上 ——
+    // 这就是它存在的全部意义：不给桌宠开一条绕开界面的旁路。
+    //
+    // ★ 三条纪律：
+    //   ① 只能排**注册表里登记过**的按钮（`UI_ACTIONS`）——
+    //      一个"给我选择器我就点"的服务端等于一条任意动作通道；
+    //   ② `writes: true` 的动作必须带 `confirmed: true`（人点出来的那一下）；
+    //   ③ 取活时**顺手认领**（在服务端一步完成），否则两个窗口会同时按同一颗按钮。
+    if (req.method === 'GET' && url.pathname === '/ui/actions') {
+      return json(res, 200, {
+        pages: UI_PAGES,
+        actions: UI_ACTIONS,
+        tasks: listTasks(uiWorkspaceRoot(), { limit: 40 }),
+        queueSpeech: renderQueueSpeech(uiWorkspaceRoot()),
+      })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/ui/actions/pending') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      // ★ 读失败必须与"没有待执行"分开。把异常吞成空数组的后果是：
+      //   界面上一切正常，而桌宠排的动作永远不会被执行 —— 沉默的半闭环。
+      try {
+        const who = String(url.searchParams.get('by') ?? 'ui').slice(0, 40)
+        return json(res, 200, { tasks: claimPendingTasks(process.cwd(), who) })
+      } catch (e) {
+        return json(res, 200, {
+          tasks: [],
+          error: `QUEUE_UNREADABLE：${e instanceof Error ? e.message : String(e)} —— 这不等于「没有待执行」，是队列没读上`,
+        })
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/ui/actions') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      let body: { actionId?: unknown; confirmed?: unknown; by?: unknown; payload?: unknown }
+      try {
+        body = JSON.parse(await readBody(req)) as typeof body
+      } catch {
+        return json(res, 400, { error: 'INVALID_JSON' })
+      }
+      // ★ `payload` 只收**对象**。收字符串/数组的话，`Object.keys('abc')` 会给出
+      //   `['0','1','2']`，「参数校验」会一本正经地报"多了 0、1、2 这几个键"——
+      //   看着像在做校验，其实是把类型错误翻译成了一句谁都看不懂的话。
+      if (body.payload !== undefined && (typeof body.payload !== 'object' || body.payload === null || Array.isArray(body.payload))) {
+        return json(res, 400, { error: 'INVALID_PAYLOAD', message: 'payload 必须是一个对象（键值对），因为界面是按名字读它的。' })
+      }
+      const r = enqueueUiAction(uiWorkspaceRoot(), String(body.actionId ?? ''), {
+        requestedBy: String(body.by ?? 'operator').slice(0, 40),
+        confirmed: body.confirmed === true,
+        ...(body.payload === undefined ? {} : { payload: body.payload as Record<string, unknown> }),
+      })
+      if (!r.ok) {
+        // 422 只留给"缺人确认"这一种 —— 它和"这个动作不存在"的下一步动作完全不同，
+        // 压成同一个状态码会让前端只能给出同一句话。
+        return json(res, r.reason === 'UI_ACTION_NEEDS_CONFIRM' ? 422 : 404, { ok: false, reason: r.reason, speech: r.speech })
+      }
+      appendEvent('UI_ACTION_ENQUEUED', { id: r.task.id, actionId: r.task.actionId, page: r.task.page, requestedBy: r.task.requestedBy, confirmed: r.task.confirmed === true, ...(r.task.payload ? { payload: r.task.payload } : {}) })
+      return json(res, 200, { ok: true, task: r.task })
+    }
+
+    const uiResult = /^\/ui\/actions\/([A-Za-z0-9_-]{4,40})\/result$/.exec(url.pathname)
+    if (uiResult && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      let body: { ok?: unknown; detail?: unknown; by?: unknown }
+      try {
+        body = JSON.parse(await readBody(req)) as typeof body
+      } catch {
+        return json(res, 400, { error: 'INVALID_JSON' })
+      }
+      const r = completeUiAction(uiWorkspaceRoot(), uiResult[1]!, {
+        ok: body.ok === true,
+        detail: typeof body.detail === 'string' ? body.detail.slice(0, 300) : '',
+        requestedBy: String(body.by ?? 'ui').slice(0, 40),
+      })
+      if (!r.ok) return json(res, 404, { error: r.reason })
+      appendEvent('UI_ACTION_RESULT', { id: uiResult[1]!, ok: body.ok === true, detail: typeof body.detail === 'string' ? body.detail.slice(0, 300) : '' })
+      return json(res, 200, { ok: true })
+    }
+
     // ── 决策证据可观测性（内化 R20 snapshot_observability）───────────────
     // 从事件流里取出所有开仓决策，按证据完整度分档，并给出样本质量是否
     // 足以支撑心法提炼的裁决。这让「复盘样本好不好」变成可度量的量。
@@ -1315,6 +2003,91 @@ const httpServer = createServer(async (req, res) => {
     }
 
     /**
+     * 查阅桌宠对话记录（Task #114）。
+     *
+     * ★ 为什么需要一个**端点**而不是让前端直接读文件：桌宠的两种形态
+     *   （控制台页 / 悬浮窗）与将来任何客户端都要看同一份记录，
+     *   而"读文件"这件事只能有一个实现（判据 8）。
+     *
+     * ★ 分页按 `beforeAt`（时间戳）而不是 `turnId`：`turnId` 是进程内自增，
+     *   重启后会重复，拿它翻页会跳过或重复整段记录。
+     *
+     * ★ 端点**不改任何状态**：查阅不影响会话，也不写盘。
+     */
+    if (req.method === 'GET' && url.pathname === '/voice/transcript') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const limitRaw = Number(url.searchParams.get('limit') ?? '')
+      const beforeRaw = Number(url.searchParams.get('beforeAt') ?? '')
+      return json(
+        res,
+        200,
+        voiceTranscript({
+          ...(Number.isFinite(limitRaw) && limitRaw > 0 ? { limit: limitRaw } : {}),
+          ...(Number.isFinite(beforeRaw) && beforeRaw > 0 ? { beforeAt: beforeRaw } : {}),
+        }),
+      )
+    }
+
+    /**
+     * 永久记忆查阅。
+     *
+     * ★ 它是**只读**的：查阅记忆不改变记忆（不写盘、不改会话）。
+     *   与 `/voice/transcript` 同一条纪律 —— 一个"看一次就变一次"的查页面
+     *   会让用户不敢用（而这正是他验收"你记不记得"的唯一手段）。
+     *
+     * ★ 为什么必须有这个端点：没有它的话，"桌宠记住了"这件事
+     *   **无法被验收** —— 用户只能从"它答得对不对"反推，
+     *   而猜对与记住在输出上长得一模一样（判据 D5）。
+     */
+    if (req.method === 'GET' && url.pathname === '/voice/memory') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      return json(res, 200, voiceMemoryView())
+    }
+
+    /**
+     * ── 手机端远程指挥（Telegram）───────────────────────────────────────
+     *
+     * 读：通道状态 + 人话 + **待放行的会话清单**。
+     *
+     * ★ 为什么"待放行清单"是这里最要紧的一格：它第一次配置时**唯一**需要
+     *   的信息就是"我那个会话的 chat id 是什么"。没有它，用户只能对着
+     *   一段日志找 id，而那条日志在别的机器/别的窗口里。
+     *   有了它，整个开通动作是：手机发一句 → 面板上点一下。
+     *
+     * ★ 需要授权：它带着陌生人的 chat id（可能是真名/用户名），
+     *   也暴露"这道门现在的状态"。与 `/voice/memory` 同一条纪律。
+     */
+    if (req.method === 'GET' && url.pathname === '/voice/telegram') {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      return json(res, 200, telegramView())
+    }
+
+    /**
+     * 放行 / 收回一个会话。
+     *
+     * ★★ 这个端点**只能由人**（拿着本地令牌的面板）调用，而且**绝不自动绑定**。
+     *   "第一个发消息的人就是主人"是本模块最危险的一个默认值：
+     *   它把一个"谁都能搜到的 bot username"变成"谁先说话谁就能下单"。
+     *   所以开通动作必须是一次**人的点击**，不能由消息内容触发。
+     *
+     * ★ 两个方向都提供（allow / revoke），因为一个只能加不能减的权限表
+     *   是一个死门：抄错一位数字之后，用户唯一的补救手段是手工改 JSON。
+     */
+    if (req.method === 'POST' && (url.pathname === '/voice/telegram/allow' || url.pathname === '/voice/telegram/revoke')) {
+      if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
+      const body = JSON.parse((await readBody(req)) || '{}') as { chatId?: unknown; label?: unknown }
+      const chatId = String(body.chatId ?? '').trim()
+      if (chatId.length === 0) return json(res, 422, { error: 'CHAT_ID_REQUIRED' })
+      const label = String(body.label ?? '').slice(0, 40)
+      const isAllow = url.pathname.endsWith('/allow')
+      const ok = isAllow ? allowTelegramChat(chatId, label) : revokeTelegramChat(chatId)
+      // ★ 返回**整份新状态**而不是 `{ok:true}`：面板上那一栏（白名单条数、
+      //   待放行清单、人话）都得跟着变。只回一个布尔值时，前端要再拉一次，
+      //   而那一次拉到的可能是"还没写完"的中间态。
+      return json(res, ok ? 200 : 500, { ...telegramView(), changed: { chatId, action: isAllow ? 'allow' : 'revoke', ok } })
+    }
+
+    /**
      * 合成引擎状态。
      *
      * 暴露它是因为"音色太生硬"这个抱怨有两个完全不同的成因：
@@ -1357,10 +2130,24 @@ const httpServer = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/voice/utterance') {
       if (!authorized(req)) return json(res, 401, { error: 'UNAUTHORIZED' })
-      const body = JSON.parse(await readBody(req)) as { text?: string }
+      const body = JSON.parse(await readBody(req)) as {
+        text?: string
+        attachments?: { name?: string; mimeType?: string; dataBase64?: string }[]
+      }
       const text = typeof body.text === 'string' ? body.text : ''
-      if (text.trim().length === 0) return json(res, 422, { error: 'EMPTY_UTTERANCE' })
-      const r = await handleUtterance(text)
+      // 附件受理放在这一层，是因为它必须能被**单独观测**：
+      // 「用户给了图但系统没看到图」这件事，事后只能靠这一条事件分辨。
+      const attachments: RawAttachment[] = Array.isArray(body.attachments)
+        ? body.attachments
+            .filter((a) => a && typeof a.dataBase64 === 'string' && a.dataBase64.length > 0)
+            .map((a) => ({ name: String(a.name ?? '未命名附件'), mimeType: a.mimeType, dataBase64: String(a.dataBase64) }))
+        : []
+      // ★ 只有附件、没有文字是合法输入（贴一张图问"这是什么"）。
+      //   旧判据是"文字为空就 422"，那会把这条路径直接废掉。
+      if (text.trim().length === 0 && attachments.length === 0) {
+        return json(res, 422, { error: 'EMPTY_UTTERANCE' })
+      }
+      const r = await handleUtterance(text, attachments)
       // 400 表示"没执行"（被打断或解析不出来），200 表示轮次正常结束。
       // 被打断的轮次仍返回 200 但带 dropped=true —— 前端必须据此**不要**念出来。
       return json(res, 200, r)
@@ -1522,7 +2309,73 @@ setInterval(() => {
   })()
 }, 30_000)
 
-function attachVenue(): void {
+/**
+ * ★★ 挂载**之前**先把这把钥匙的权限范围问清楚（2026-09-22 接进生产路径）。
+ *
+ * 为什么要在 attach 之前、而不是"以后有空再查"：
+ * `attachAdapter()` 一旦返回，网关就认为"可以出网了"。而 `classifyKeyScope` 判的是
+ * 一件**比单笔金额更根本**的事 —— 这把钥匙能不能**绕过本系统把资金提走**。
+ * 能提币的 key 面前，1R 定规模 / 资金帽 / 宪法红线全都只是"系统自己愿意遵守"
+ * （判据见 `keyScope.ts` 顶部）。所以它必须和"挂载"同一个时点被问到，
+ * 否则它在时间线上就永远排在"已经可以下单了"之后。
+ *
+ * ★ 三态严格对应三种处置，**不许合并**（判据 13 / ㉚ 四态互不顶替的精神）：
+ *   · ok           → 挂载
+ *   · danger (P0)  → **不挂载**。这是 P0，不参与任何压制（红线 ⑤）。
+ *   · unverifiable → **挂载，但把事说出来**。
+ *     ★ 这里刻意**不**因为 unverifiable 而拒绝挂载，理由是本项目已确立的分工：
+ *       权限取证失败的原因通常是**场所不支持该接口 / 网络不通**，而这类原因
+ *       与"这笔交易该不该发"无关；把它升级成"拒绝挂载"会让一个**与交易无关的
+ *       故障**停掉整条通道（判据 A1：误报比不报错更费人）。
+ *       而 danger 不同：它是一个**已确证的**能力，危害是确定性的。
+ *     ★ 但"挂载"不等于"沉默"：走 `appendEvent` + `console.warn` 两处都留痕，
+ *       并写进下面的 `keyScopeNote`，让交易大厅能显示出来。
+ *
+ * ★ 失败不许吞：`fetchAccountRaw()` 抛错（401/网络）留给调用方 catch，
+ *   由调用方决定是"本次是 unverifiable"还是"直接不挂载"。
+ */
+async function verifyAttachedKeyScope(venue: string, adapter: { fetchAccountRaw?: () => Promise<unknown> }): Promise<{ allow: boolean; note: string | null }> {
+  if (typeof adapter.fetchAccountRaw !== 'function') {
+    // 适配器没提供取证口（SandboxAdapter 等）—— 说清楚"没查"，不假装"查过了没问题"
+    return { allow: true, note: null }
+  }
+  let raw: unknown
+  try {
+    raw = await adapter.fetchAccountRaw()
+  } catch (e) {
+    const msg = e instanceof Error ? e.message.slice(0, 120) : String(e)
+    appendEvent('KEY_SCOPE_UNVERIFIABLE', { venue, reason: msg })
+    console.warn(`⚠️ [key-scope] ${venue} 权限未能确认（${msg}）· 交易通道保持可用，但请人工核对 BINANCE/OKX 后台的 key 权限`)
+    return { allow: true, note: `权限未确认（${msg}）` }
+  }
+
+  const v = classifyKeyScope(venue, raw)
+  appendEvent('KEY_SCOPE_CHECKED', {
+    venue,
+    status: v.status,
+    read: v.read,
+    trade: v.trade,
+    withdraw: v.withdraw,
+    severity: v.severity,
+    summary: v.summary,
+  })
+
+  if (v.status === 'danger') {
+    // P0：不挂载，且要用一段能直接照着做的处置说明
+    console.error(`⛔ [key-scope] ${v.summary}`)
+    for (const r of v.reasons) console.error(`   · ${r}`)
+    return { allow: false, note: v.summary }
+  }
+  if (v.status === 'unverifiable') {
+    console.warn(`⚠️ [key-scope] ${v.summary}`)
+    for (const r of v.reasons) console.warn(`   · ${r}`)
+    return { allow: true, note: v.summary }
+  }
+  console.log(`[OK] [key-scope] ${v.summary}`)
+  return { allow: true, note: null }
+}
+
+async function attachVenue(): Promise<void> {
   const kind = (process.env.VENUE ?? 'sandbox').toLowerCase()
   if (kind === 'sandbox') {
     liveGateway.attachAdapter(new SandboxAdapter())
@@ -1536,6 +2389,9 @@ function attachVenue(): void {
       console.warn('⚠️ VENUE=cex-testnet 但缺少 BINANCE_TESTNET_API_KEY/SECRET · gateway 保持未挂载（fail-closed）')
       return
     }
+    // ★ 先问权限，再挂载（顺序不能反 —— 理由见 verifyAttachedKeyScope 顶部注释）
+    const scope = await verifyAttachedKeyScope('binance-testnet', a)
+    if (!scope.allow) return
     liveGateway.attachAdapter(a)
     liveGateway.completeRiskHandshake()
     console.log('[OK] venue=cex-testnet 已挂载 · 风控握手完成')
@@ -1547,6 +2403,8 @@ function attachVenue(): void {
       console.warn('⚠️ VENUE=okx-testnet 但缺少 OKX_TESTNET_API_KEY/SECRET/PASSPHRASE · gateway 保持未挂载（fail-closed）')
       return
     }
+    const scope = await verifyAttachedKeyScope('okx-testnet', a)
+    if (!scope.allow) return
     liveGateway.attachAdapter(a)
     liveGateway.completeRiskHandshake()
     console.log('[OK] venue=okx-testnet (模拟盘/零真实资金) 已挂载 · 风控握手完成')
@@ -1623,7 +2481,10 @@ configureAutopilot({ getState: getOrchState })
 
 seedHistory()
   .catch(() => undefined)
-  .finally(() => {
+  // ★ 这个回调必须是 `async`：`attachVenue()` 现在要 await 一次权限自检
+  //   （`verifyAttachedKeyScope`）。`.finally()` 的返回值会被串进链里，
+  //   所以异步回调也能被正确等待 —— 下面的 `await attachVenue()` 不会变成悬空 promise。
+  .finally(async () => {
     initLedger()
     // 单写者围栏：同一账本只允许一个实例写入（防审计链分叉，见 seq 154 事故）
     try {
@@ -1647,9 +2508,64 @@ seedHistory()
       proposals.bindDb(db as unknown as Parameters<typeof proposals.bindDb>[0])
       bindLlmProvidersDb(db as unknown as Parameters<typeof bindLlmProvidersDb>[0])
     }
-    attachVenue()
+    // 把"环境里已经有凭据的厂商"接进来。
+    //
+    // ★ 为什么必须做、且必须在启动时做：实测唯一启用的厂商（opencode）
+    //   免费档对外部调用 403、付费档 402 —— 在修好这一点之前，整个系统里
+    //   **没有任何一条路能真的调到模型**，于是桌宠对任何问题都只能回"我不会"。
+    //   它不联网、也不动已有厂商，只新增一条被真调过的路（见 llmCatalog.ts）。
+    const envProv = ensureEnvProvider()
+    if (!envProv.registered) {
+      console.log(`[llm] 未从环境变量注册厂商：${envProv.note}`)
+      if (!getActiveLlm()) {
+        console.log('[llm] ⚠️ 当前没有任何可用厂商 —— 桌宠会退化成"只能查系统数据"，无法回答开放问题')
+      }
+    } else {
+      console.log(`[llm] 厂商 ${envProv.name} ${envProv.note} · ${envProv.models} 个已验证模型 · 首选 ${envProv.activeModel}`)
+      // ★ 逐条打印账号明细：用户说「我多给配一些账号」，那他就要能一眼看见
+      //   "系统到底认出几个、哪一个在册、哪一个新增"。只打一句"认出 3 个账号"
+      //   回答不了"我新加的那一行生效了吗"这个问题。
+      for (const d of envProv.details) console.log(`[llm]   · 账号 ${d}`)
+      if (envProv.accounts > 1) {
+        console.log(`[llm] 账号池 ${envProv.accounts} 个：某个账号额度打满会自动换下一个（额度按天复位，不永久拉黑）`)
+      }
+    }
+    // ★ `await` 是刻意的：权限自检（`verifyAttachedKeyScope`）必须在"网关可用"
+    //   这件事对外成立**之前**完成。若改成 fire-and-forget，会出现一个时间窗 ——
+    //   窗口内网关已经能出网，而"这把钥匙能不能提币"还没问过。
+    //   代价是启动多一次交易所往返（仅 VENUE != sandbox 时发生）。
+    await attachVenue()
     bindRetentionDb(() => getDb() as never)
     startRetentionLoop(true)
+    // 舰队注册表与消息总线在启动时就装好。装上才会有订阅者 ——
+    // 而"某个主题没有订阅者"是注册表审计的一条硬红线，所以这一步是
+    // `/fleet` 第一次被读时不会报红的前提，不能等到有请求才做。
+    ensureFleetInstalled()
+
+    // ── 自治循环：开机自启（用户要求「自循环需要长开」）──────────────────
+    // ★ 必须放在 `ensureFleetInstalled()` **之后**：循环里的每一项都通过
+    //   `runTask` 走注册表，注册表没装好就排程，第一次触发时每一项都会失败。
+    // ★ 它只排程、不立即执行 —— 每一项都有自己的 initialDelayMs（最短 1 分钟），
+    //   这是为了让启动过程本身干净（启动瞬间把所有任务一起打出去，
+    //   会把"启动失败"与"任务失败"两种现象搅在一起）。
+    {
+      const auto = autostartAutonomy()
+      const st = auto.status
+      if (auto.reason === 'STARTED') {
+        console.log(`[fleet] 自治循环已开机自启（${st.jobs.length} 项）：${st.jobs.map((j) => j.label).join(' / ')}`)
+        for (const j of st.jobs) {
+          const next = j.nextAt ? new Date(j.nextAt).toLocaleTimeString('zh-CN', { hour12: false }) : '未排程'
+          console.log(`[fleet]   · ${j.label}：每 ${Math.round(j.everyMs / 3_600_000)} 小时一次，首次 ${next}`)
+        }
+        console.log('[fleet] 循环里只跑**可逆**动作；不可逆的（真删 / 下单 / 改码）只报告不动手。要关掉设 EV_AUTONOMY=off')
+      } else if (auto.reason === 'ALREADY_RUNNING') {
+        console.log('[fleet] 自治循环本来就在跑（幂等：没有重复排程）')
+      } else if (auto.reason === 'DISABLED_BY_ENV') {
+        console.log('[fleet] 自治循环被 EV_AUTONOMY 显式关掉了 —— 它不会自己动，只能人工触发')
+      } else {
+        console.log(`[fleet] ⚠️ 自治循环自启失败：${auto.detail}`)
+      }
+    }
 
     // C-12 镜像互查：事件携带来源 seq+hash 镜像至独立账本；周期性双向校验与自愈补投
     const mirrorUrl = process.env.ORCH_LEDGER_URL
@@ -1702,13 +2618,64 @@ seedHistory()
 
     httpServer.listen(PORT, () => {
       console.log(`[OK] EVOLVE orchestration 已启动 port=${PORT} mode=paper symbols=${SYMBOLS.join(',')}`)
-      console.log(`  REST http://localhost:${PORT}/healthz /state /orders /killswitch /gateway/status /metrics /audit/verify /promotions /proposals /autopilot`)
+      console.log(`  REST http://localhost:${PORT}/healthz /state /orders /killswitch /gateway/status /metrics /audit/verify /promotions /proposals /factors/index /factors/strategies /factors/generate /fleet /fleet/run /fleet/task /autopilot`)
       console.log(`  语音 http://localhost:${PORT}/voice/config /voice/state /voice/daily /voice/utterance /voice/interrupt /voice/stream(SSE)`)
+      console.log(`  记忆/记录 http://localhost:${PORT}/voice/memory /voice/transcript   手机端 http://localhost:${PORT}/voice/telegram`)
       // 语音层必须在 initLedger 之后启动：它要从账本链尾对齐播报游标，
       // 早于持久层初始化会被当成"链是空的"从而把历史事件全部念一遍。
       startVoice()
+
+      // ── 手机端通道（Telegram）─────────────────────────────────────────
+      // ★ 启动**不带条件地尝试**，但结果必须**说出来**。四种状态里最危险的一种
+      //   是"配了 token、白名单却是空的"：通道在跑、日志有"已启动"、
+      //   而任何人的消息都会被拒 —— 用户看到的现象是"手机发了没反应"，
+      //   会去查网络。所以这里一次把 configured / allowed / polling 报全。
+      {
+        const r = startTelegramPolling()
+        if (!r.ok) {
+          console.log(`[--] 手机端通道（Telegram）：未启动 —— ${r.reason}。配好 TELEGRAM_BOT_TOKEN 后重启即可。`)
+        } else {
+          const tv = telegramView()
+          if (tv.allowedChats === 0) {
+            console.warn(
+              `[!!] 手机端通道（Telegram）在跑，但放行名单是空的 —— 现在**谁都不能**通过它下指令。` +
+                `在手机上给 bot 发一句话，然后到监控页 /voice/telegram 点「放行」。`,
+            )
+          } else {
+            console.log(`[OK] 手机端通道（Telegram）：${tv.allowedChats} 个会话可下指令 · ${tv.speech}`)
+          }
+          if (tv.chatListError) console.warn(`[!!] Telegram 白名单文件有问题：${tv.chatListError}`)
+        }
+        // ★ 退出时显式停一轮，好让账本里留下 `TELEGRAM_POLLING_STOPPED`。
+        //   没有它的话，"被要求退出"与"自己死了"在事后查证里长得一模一样
+        //   —— 而这两件事的处置方向完全相反（一个什么都不用做，一个要查异常）。
+        //   `exit` 处理里抛异常会盖掉真正的退出码，所以这里一律吞掉。
+        process.on('exit', () => {
+          try {
+            stopTelegramPolling()
+          } catch {
+            /* 退出路径不许再抛 */
+          }
+        })
+      }
       // 后台预热过拟合证据：一次完整 walk-forward 约 20 秒。
       // 不预热则第一次点「跑 backtest 门」要干等 20 秒；预热失败不影响可用性。
       warmEvidence(SYMBOLS[0] ?? 'BTCUSDT')
+      // 因子门的可达性自检：带阈值的闸门最隐蔽的失效是"永远不可能通过"
+      // （门槛比数据规模还大 ⇒ 全部 unverifiable，不报错、台账照长）。
+      // 历史存在却太短 ⇒ 直接抛；历史不存在 ⇒ 说出来但继续跑。
+      try {
+        const reach = checkGateReachable(SYMBOLS[0] ?? 'BTCUSDT')
+        console.log(`[OK] 因子门可达性：${reach.reason}`)
+      } catch (e) {
+        console.error(`[FAIL] 因子门配置矛盾：${e instanceof Error ? e.message : e}`)
+        throw e
+      }
+      const fi = factorIndexSummary()
+      console.log(
+        fi.available
+          ? `[OK] 因子台账 ${fi.total} 条（通过 ${fi.accepted} / 不可验证 ${fi.unverifiable}）· ${fi.reason}`
+          : `[--] 因子台账：${fi.reason}`,
+      )
     })
   })

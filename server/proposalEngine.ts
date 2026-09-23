@@ -1,4 +1,5 @@
 import { evaluateCandidateGrid, genSynthCandles } from '../src/engine/index.ts'
+import { buildAcceptedFactorStrategies } from './factorStrategyService.ts'
 import type { CandidateResult, Candle } from '../src/engine/index.ts'
 import { adx as computeAdx, atr as computeAtr } from '../src/engine/indicators.ts'
 import { proposals } from './proposals.ts'
@@ -11,6 +12,7 @@ import { assembleContext, renderBudgetReport, DEFAULT_CONTEXT_BUDGET_TOKENS } fr
 import type { AssembledContext } from './contextBudget.ts'
 import { validateClaims, summarizeReport } from './claimValidator.ts'
 import type { MeasuredFacts, ValidationReport } from './claimValidator.ts'
+import { loadEvidence } from './evidence.ts'
 import type { OrchState } from './types.ts'
 
 export interface GenerateOptions {
@@ -36,6 +38,8 @@ export interface GenerateResult {
   verdicts: ProposalVerdict[]
   promotedStrategyIds: string[]
   gridTop: { id: string; fitness: number }[]
+  /** 本轮提案所用的**数据来源**。这个事实必须可观测： */
+  dataOrigin: string
   /** 声称核验：模型说的与实测是否对得上。空数组表示本轮无 LLM 提案或未启用核验。 */
   claimChecks: ClaimCheck[]
   /** 上下文预算执行情况。提示词有没有被裁必须是可回溯事实，而不是出问题时才想起的问题。 */
@@ -80,7 +84,26 @@ export function measureFacts(candles: Candle[]): MeasuredFacts {
 
 function buildCandles(state: OrchState, injected?: Candle[]): { candles: Candle[]; origin: string } {
   if (injected && injected.length >= 120) return { candles: injected, origin: 'injected' }
-  // 确定性合成数据：seed 按小时轮换，保证同一小时内可复现、跨小时有变化
+  // ── 数据来源：优先真实历史，与门禁同源 ──────────────────────────────
+  //
+  // 旧写法是"种子按小时轮换的合成 GBM"，而下游的过拟合门禁
+  // （`server/evidence.ts`）吃的是 `data/history/*.json` 真实历史 ——
+  // 于是**提案在被挑选时用的是一套数据、被判决时用的是另一套**。
+  //
+  // 这不是"精度不够"，是两个具体且已发生的后果：
+  //   ① 合成 GBM 里不存在可被策略捕捉的结构（evidence.ts 的开篇实测表
+  //      已把这条钉死）。在这一套数据上按 fitness 取 Top-N，选出来的
+  //      **是噪声排名**，而不是"候选里最好的那个"。
+  //   ② 种子每小时换一次，所以同一批候选每隔一小时就得到一套不同的排名，
+  //      产出的提案与写进心法库的经验都在跟着漂 —— 事后无法复现任何结论。
+  //
+  // 改法就是让两级吃同一份数据。回落到合成时**把 origin 标出来**，
+  // 让下游能分辨"这份提案是在真行情上挑的还是在合成行情上挑的"。
+  const ev = loadEvidence('BTCUSDT', 15)
+  if (ev.origin === 'history' && ev.candles.length >= 120) {
+    return { candles: ev.candles, origin: `history:${ev.symbol}:${ev.bars}bars:${ev.dataHash}` }
+  }
+  // 没有真实历史时的兜底保持原样（确定性合成），但 origin 里必须写明是合成。
   const seed = 42 + Math.floor(Date.now() / 3_600_000)
   void state
   return {
@@ -167,7 +190,24 @@ async function callLlm(prompt: string): Promise<Array<Record<string, unknown>> |
 export async function generateProposals(state: OrchState, opts: GenerateOptions = {}): Promise<GenerateResult> {
   const max = Math.max(1, Math.min(opts.maxProposals ?? 2, 5))
   const { candles, origin } = buildCandles(state, opts.candles)
-  const grid = evaluateCandidateGrid(candles)
+  // ── 因子生产线 → 候选池的唯一接线点 ──────────────────────────────────
+  //
+  // 在这一行之前，本项目有两条彼此看不见的线：
+  //   ① 因子生产线把 accepted 写进 `data/factors/index.json`
+  //   ② 提案引擎只搜它那 12 个手写策略
+  // 结果"因子批量生产达标"在生产上不可见 —— 台账在磁盘上安静地长。
+  //
+  // ★ `buildAcceptedFactorStrategies` 会**拒绝**行情指纹已变的台账行，
+  //   并把原因放进 `skipped`。这里把它说出来而不是吞掉：
+  //   一条"因子明明接受了却没进候选池"的静默失效，排查成本极高。
+  const factorPick = buildAcceptedFactorStrategies()
+  if (factorPick.skipped.length > 0) {
+    console.log(
+      `[proposal-engine] 因子策略未入池 ${factorPick.skipped.length} 条：` +
+        factorPick.skipped.map((s) => `${s.slug}(${s.reason})`).join(' · '),
+    )
+  }
+  const grid = evaluateCandidateGrid(candles, 15, factorPick.strategies)
 
   // 有可用 LLM 时默认走模型提案（测试期统一用免费模型），无可用 LLM 时自动降级确定性引擎。
   // 此前默认 'human'，导致即使 provider 已启用，Agent 团队也不会参与因子挖掘。
@@ -278,6 +318,7 @@ export async function generateProposals(state: OrchState, opts: GenerateOptions 
   return {
     source,
     llmUsed: source === 'llm' && raws !== null,
+    dataOrigin: origin,
     verdicts,
     promotedStrategyIds,
     gridTop: grid.slice(0, max).map((c) => ({ id: c.id, fitness: c.fitness })),

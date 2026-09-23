@@ -31,6 +31,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { PendingConfirmation, VoiceTurn, OrderSlots, TurnState, VoiceStatus, VoiceIntentName } from './types.ts'
+import { recordUserTurn, recordAssistantTurn, recordTurnIntent } from './transcript.ts'
 
 /**
  * 需要"复述金额"的名义额门槛。
@@ -52,7 +53,29 @@ let interruptedCount = 0
 /** 被打断而**丢弃**的答复数。与 interruptedCount 分开记：前者是用户动作，后者是真实止损。 */
 let droppedReplies = 0
 
-export function beginTurn(utterance: string): VoiceTurn {
+/**
+ * 本次进程的会话 id。
+ *
+ * ★ 为什么必须有它：`turnId` 只是**进程内**的自增序号，进程一重启就从 1 重来。
+ *   聊天记录是跨进程累积的文件，如果只按 `turnId` 配对，"昨天第 3 轮"和
+ *   "今天第 3 轮"就会被拼成同一轮 —— 而拼出来的那轮**看着完全正常**，
+ *   两边的话都像人说的（判据 29：一句话只能有一个主人）。
+ *   所以配对键是 `sid + turnId`，`sid` 每次进程启动换一次。
+ */
+const sid = `s${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`
+
+export function sessionId(): string {
+  return sid
+}
+
+export function beginTurn(
+  utterance: string,
+  /**
+   * 附件元信息（不含内容）。只记"当时贴了什么"，不落原始字节 ——
+   * 聊天记录是给人查对话的，不是第二份附件库。
+   */
+  attachments: readonly { name: string; mimeType: string; bytes: number }[] = [],
+): VoiceTurn {
   turnSeq += 1
   currentTurn = {
     turnId: turnSeq,
@@ -61,7 +84,38 @@ export function beginTurn(utterance: string): VoiceTurn {
     reply: '',
     ts: Date.now(),
   }
+  // ★ 落盘放在这里（会话状态机）而不是 service 层：
+  //   `commitReply` 在 service 里有 **4 个调用点**（3 处在 handleConfirm、
+  //   1 处在 finish 闭包），在那一层落盘就等于"同一个业务动作有四条实现
+  //   路径"，将来加第 5 个出口必漏（判据 8）。而任何一轮对话都**必须**
+  //   经过 beginTurn 才能存在 —— 这里是唯一必经点。
+  recordUserTurn({
+    sid,
+    turnId: currentTurn.turnId,
+    text: utterance,
+    at: currentTurn.ts,
+    attachments: attachments.map((a) => ({ name: a.name, mimeType: a.mimeType, bytes: a.bytes })),
+  })
   return currentTurn
+}
+
+/**
+ * 补记本轮的意图 / 失败原因。
+ *
+ * ★ 为什么是"补记"：意图解析发生在 `beginTurn` **之后**（要先有 turnId 才能记），
+ *   而我们落盘是追加式的、绝不改写已提交的行 —— 所以意图只能另起一行，
+ *   读取时按 `(sid, turnId)` 合并。
+ *
+ * ★ 它顺带修掉一处静默的哑失败：`VoiceTurn.intent` 这个字段**一直都存在，
+ *   但在此之前从来没有被赋值过**（`setTurnState` 的调用点是空的）。
+ *   一个永远 `undefined` 的字段配上"面板要显示意图"的期望，
+ *   表现就是"意图那一栏永远是空的"，而没有任何地方会报错。
+ */
+export function setTurnMeta(turnId: number, patch: { intent?: VoiceIntentName; reason?: string }): boolean {
+  if (!currentTurn || currentTurn.turnId !== turnId) return false
+  currentTurn = { ...currentTurn, ...patch }
+  if (patch.intent) recordTurnIntent(sid, turnId, patch.intent, Date.now())
+  return true
 }
 
 export function setTurnState(turnId: number, state: TurnState, patch?: Partial<VoiceTurn>): boolean {
@@ -78,15 +132,21 @@ export function setTurnState(turnId: number, state: TurnState, patch?: Partial<V
  * 把这个判断做成返回值而不是"顺手 return"，是为了让它可被断言。
  */
 export function commitReply(turnId: number, reply: string, gen: number): boolean {
-  if (gen !== generation) {
+  // 意图可能已由 `setTurnMeta` 补记，也可能还没有。拿不到就**不写** ——
+  // 不猜一个"大概是这个"填进去（派生值不当独立证据）。
+  const intent = currentTurn && currentTurn.turnId === turnId ? currentTurn.intent : undefined
+  const drop = (reason: 'generation' | 'turn'): false => {
     droppedReplies += 1
+    recordAssistantTurn({ sid, turnId, text: reply, at: Date.now(), gen, dropped: true, dropReason: reason, intent })
     return false
   }
-  if (!currentTurn || currentTurn.turnId !== turnId) {
-    droppedReplies += 1
-    return false
-  }
+  if (gen !== generation) return drop('generation')
+  if (!currentTurn || currentTurn.turnId !== turnId) return drop('turn')
   currentTurn = { ...currentTurn, state: 'done', reply }
+  // ★ 作废的答复也要落盘，但不是为了"留案底"：是为了让"我以为它在答、
+  //   其实一个字都没念"这件事可查。不记的话，用户回看记录只会看到
+  //   自己问了一句、下面空着 —— 而"它没答"与"它答了但被打断"是两件事。
+  recordAssistantTurn({ sid, turnId, text: reply, at: Date.now(), gen, dropped: false, intent })
   return true
 }
 
@@ -128,8 +188,18 @@ export function createPending(
   slots: OrderSlots,
   resolvedNotional: number,
   originTurnId: number,
+  /** 非订单类动作的文字参数（心法正文）。语义不同的东西不共用 `slots`，理由见 types.ts。 */
+  intentArg?: string,
 ): PendingConfirmation {
-  const amount = slots.qty !== undefined && slots.notional === undefined ? slots.qty : (slots.notional ?? slots.qty ?? 0)
+  const lev = Number.isFinite(slots.leverage) && (slots.leverage ?? 0) > 1 ? (slots.leverage as number) : 1
+  // 合约单里用户说的那个钱是**保证金**，所以复述值也用它 —— 他念自己刚说的数才自然。
+  // 名义额作为备选值一起收（见 types.ts 的 `expectedAmountAlt`）。
+  const isMargin = slots.amountBasis === 'margin' && slots.notional !== undefined && lev > 1
+  const amount = isMargin
+    ? (slots.notional as number) / lev
+    : slots.qty !== undefined && slots.notional === undefined
+      ? slots.qty
+      : (slots.notional ?? slots.qty ?? 0)
   pending = {
     token: randomUUID().slice(0, 8),
     ts: Date.now(),
@@ -137,6 +207,7 @@ export function createPending(
     intent,
     action,
     expectedAmount: amount,
+    ...(isMargin ? { expectedAmountAlt: slots.notional as number } : {}),
     amountBasis: slots.amountBasis ?? (slots.qty !== undefined ? 'qty' : 'notional'),
     /**
      * 服务端按实时标记价折算出的名义额 —— 风险分档量的是**钱**，
@@ -146,6 +217,40 @@ export function createPending(
     expectedNotional: Number.isFinite(resolvedNotional) ? resolvedNotional : 0,
     slots,
     originTurnId,
+    ...(intentArg !== undefined ? { intentArg } : {}),
+  }
+  return pending
+}
+
+/**
+ * 为**界面按钮**建一条待确认。
+ *
+ * ★ 为什么不让它走 `createPending`：那个函数要收 `slots` 与 `resolvedNotional`，
+ *   然后算出 `expectedAmount`、`expectedNotional`、风险分档。
+ *   "按一下保存参数"没有金额、没有方向、没有名义额 —— 硬填一组零进去，
+ *   确认回话就会变成"请复述金额 0"。所以两种东西各走各的构造器，
+ *   它俩共用的只有 `pending` 这个**单槽**（一次只能等一个确认）。
+ */
+export function createPendingUiAction(
+  actionId: string,
+  actionLabel: string,
+  originTurnId: number,
+): PendingConfirmation {
+  pending = {
+    token: randomUUID().slice(0, 8),
+    ts: Date.now(),
+    expiresAt: Date.now() + PENDING_TTL_MS,
+    // 路由只认 `intent`，所以这里给一个明确的机器标识，
+    // **不**复用任何订单意图 —— 复用会让"按按钮"在日志里长得像"下单"。
+    intent: 'ui_action',
+    action: actionLabel,
+    expectedAmount: 0,
+    amountBasis: 'notional',
+    expectedNotional: 0,
+    slots: { side: 'buy', symbol: '' },
+    originTurnId,
+    uiActionId: actionId,
+    uiActionLabel: actionLabel,
   }
   return pending
 }
@@ -197,11 +302,14 @@ export function confirmPending(
     }
   }
 
-  const rel = Math.abs(parsedAmount.value - p.expectedAmount) / Math.max(p.expectedAmount, 1e-9)
-  if (rel > 0.005) {
+  const near = (a: number, b: number) => Math.abs(a - b) / Math.max(b, 1e-9) <= 0.005
+  // ★ 合约单收两个值：保证金（用户说的那个）与名义额（系统量的那个）。
+  //   只收一个的后果是规范操作会被判成"念错了" —— 判据 2。
+  if (!near(parsedAmount.value, p.expectedAmount) && !(p.expectedAmountAlt !== undefined && near(parsedAmount.value, p.expectedAmountAlt))) {
+    const alts = p.expectedAmountAlt !== undefined ? `${p.expectedAmount}（或名义额 ${p.expectedAmountAlt}）` : `${p.expectedAmount}`
     return {
       ok: false,
-      reason: `VOICE_CONFIRM_AMOUNT_MISMATCH（我准备执行的是 ${p.expectedAmount}，你念的是 ${parsedAmount.value} —— 可能是我听错了，请重新念一次金额）`,
+      reason: `VOICE_CONFIRM_AMOUNT_MISMATCH（我准备执行的是 ${alts}，你念的是 ${parsedAmount.value} —— 可能是我听错了，请重新念一次金额）`,
       expected: p.expectedAmount,
     }
   }

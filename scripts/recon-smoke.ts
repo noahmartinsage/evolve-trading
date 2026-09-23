@@ -4,7 +4,18 @@ import { SandboxAdapter } from '../server/venue/sandbox.ts'
 import { ExecutionGateway } from '../server/gateway/executor.ts'
 import { runReconciliation, getLastReconciliation } from '../server/reconciliation.ts'
 import { createState, submitToBroker } from '../server/orchEngine.ts'
+import { initLedger } from '../server/ledger.ts'
+import { isPersistent } from '../server/persistence.ts'
 import type { OrchState } from '../server/types.ts'
+
+// ★★ 隔离必须先于任何 `init*()`（判据 C10）。本烟测会走**真实的出网链路**，
+//   于是需要一个属于自己的库：
+//     ① 不污染用户正在运行的应用的真库（`data/orch.db`）；
+//     ② 不被上次运行留下的 `in_flight` 行挡住 —— 幂等台账记下过的语义键
+//        会被**正确地**再拦一次，那会让"手动清除后应当恢复"这条断言假红
+//        （红在了"幂等生效"上，而它其实没坏）。
+//   ★ 命名带 pid + 时间戳：天然是新文件，清理失败也不会让门禁变红。
+process.env.ORCH_DB = join('data', `recon-smoke-${process.pid}-${Date.now()}.db`)
 
 interface ReconRecord {
   startedAt: string
@@ -32,6 +43,14 @@ function archive(rec: ReconRecord): void {
 
 async function main() {
   const rec: ReconRecord = { startedAt: new Date().toISOString(), scenarios: [], finalReport: null }
+
+  // ★ `initLedger()` 必须在任何出网之前（判据 C10）：出网幂等的判据是**持久化**
+  //   语义键台账，而台账在 `getDb() === null` 时**刻意 fail-closed**。
+  //   ★ 忘了它的症状会伪装成"幂等生效" —— 第一笔就被拦、报文写"结果未知，去对账"，
+  //     而真因是"库根本没打开"。两者动作相反，所以这里加一条前置断言把它们分开。
+  initLedger()
+  if (!isPersistent()) fail(rec, 'S0 台账可用', `持久层未就绪（ORCH_DB=${process.env.ORCH_DB}）⇒ 无法区分"幂等生效"与"根本没台账"`)
+  pass(rec, 'S0 台账可用', `持久化意图台账就绪 · ${process.env.ORCH_DB}`)
 
   const state: OrchState = createState(100_000)
   const venue = new SandboxAdapter()

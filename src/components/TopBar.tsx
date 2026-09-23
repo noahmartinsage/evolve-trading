@@ -20,6 +20,10 @@ const titles: Record<PageId, { title: string; subtitle: string }> = {
   agents: { title: 'Agent 舰队', subtitle: '演示数据 · 策略舰队概念稿' },
   // 回测内核已接入（真实 K 线驱动），原"随机数占位"描述已过期
   evo: { title: '进化实验室', subtitle: '适应度已接回测引擎（真实 K 线）· 谱系树与 LLM 推理仍为演示' },
+  // 副标题把两层台账的分工写在最显眼处：用户最可能的误读是
+  // 把「因子层通过」当成「可以拿去交易」，而这两件事之间还隔着一道成本门。
+  factors: { title: '因子工厂', subtitle: '因子台账（三态 + 闸门归因）· 策略层逐折样本外（扣费后是否为正）· 指纹时效' },
+  news: { title: '新闻雷达', subtitle: '定时读 · 确定性相关性打分 · 模型只写内化提案 · 提案可确认/驳回 · 品种热度喂给 breadth' },
   protocol: { title: '协议栈', subtitle: 'x402 / ERC-8004 / MCP · 概念演示，未接真实协议' },
   monitor: { title: '系统监控', subtitle: 'orchestration 实时状态 · 下单前风控 · Kill Switch 控制' },
   // 副标题刻意写明「改动即时生效」——这正是本页与「参数设置」页的分工差异，

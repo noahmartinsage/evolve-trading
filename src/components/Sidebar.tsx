@@ -4,7 +4,14 @@ import { useAccount } from 'wagmi'
 import { chains } from '../wallet/config'
 import { listLlmProviders } from '../orch/client.ts'
 
-const navItems: { id: PageId; label: string }[] = [
+/**
+ * 导航项 —— **唯一一份**。
+ *
+ * ★ 导出它是因为命令面板（`CommandPalette.tsx`）也要列这些页面。
+ *   让它自己抄一张表 = 立刻多一个主人：以后加一页、只改侧边栏，
+ *   面板里就永远搜不到那一页，而且不会有任何报错。
+ */
+export const navItems: { id: PageId; label: string }[] = [
   { id: 'overview', label: '总览控制台' },
   // 悬浮桌宠已**合并进这一页**：`npm run pet` 起的是同一个页面的悬浮形态。
   // 导航里只留一个入口 —— 两个入口会诱导出第二套会话实现。
@@ -16,6 +23,13 @@ const navItems: { id: PageId; label: string }[] = [
   { id: 'terminal', label: '交易终端' },
   { id: 'agents', label: 'Agent 舰队' },
   { id: 'evo', label: '进化实验室' },
+  // 紧跟在进化实验室后面：因子是进化产线的**产出入库单** ——
+  // 上一层回答"这个信号有没有预测力"，这一页回答"扣掉成本还赚不赚钱"。
+  { id: 'factors', label: '因子工厂' },
+  // 紧跟在因子工厂后面：因子工厂回答"现在有没有能赚钱的信号"，
+  // 这一页回答"外面正在发生什么、系统从外面学到了什么"。
+  // 摆在因子工厂后面而不是塞进系统类，是因为它的产出**真的会**影响 breadth 的选品。
+  { id: 'news', label: '新闻雷达' },
   { id: 'protocol', label: '协议栈' },
   { id: 'risk', label: '风控中心' },
   { id: 'seam', label: '可信接缝' },
@@ -81,6 +95,17 @@ function NavIcon({ id }: { id: string }) {
       </svg>
     )
   }
+  if (id === 'factors') {
+    // 漏斗 = 逐道闸门筛选。刻意**不用**方格/表格图形：
+    // 那与总览的"四个方块"在 16px 下分不出来，而这两个入口的含义差得很远
+    // （一个是"看全貌"，一个是"看谁被哪道闸门拦下了"）。
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <path d="M2.4 2.8 L13.6 2.8 L9.3 8.3 L9.3 13.4 L6.7 12 L6.7 8.3 Z" stroke={c} strokeWidth="1.2" strokeLinejoin="round" fill="none" />
+        <path d="M5.2 5.4 L10.8 5.4" stroke={c} strokeWidth="1" strokeLinecap="round" />
+      </svg>
+    )
+  }
   if (id === 'mission') {
     // 旗子插在终点 = 目标。刻意不用"同心圆靶心"：那与决策大脑的圆心+放射线
     // 在 16px 下几乎分不出来，而这两个入口的含义差得很远
@@ -90,6 +115,19 @@ function NavIcon({ id }: { id: string }) {
         <path d="M3.6 1.6 L3.6 14.4" stroke={c} strokeWidth="1.2" strokeLinecap="round" />
         <path d="M3.6 2.4 L12.4 5.2 L3.6 8 Z" stroke={c} strokeWidth="1.2" strokeLinejoin="round" fill="none" />
         <path d="M1.8 14.4 L5.6 14.4" stroke={c} strokeWidth="1.2" strokeLinecap="round" />
+      </svg>
+    )
+  }
+  if (id === 'news') {
+    // 雷达天线 = "朝外看"。刻意**不用**喇叭/铃声（那是"通知"，会被读成
+    // 一个消息盒子）、也不用列表线条（那与交易终端的表格在 16px 下分不出来）。
+    // 含义是：它自己定时去扫，不是等人来点。
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <path d="M3.2 12.8 L3.2 9.4" stroke={c} strokeWidth="1.2" strokeLinecap="round" />
+        <path d="M11.2 12.8 C11.2 7.6 7.4 3.8 2.2 3.8" stroke={c} strokeWidth="1.2" strokeLinecap="round" fill="none" />
+        <path d="M11.2 12.8 C11.2 10.2 9.4 8.4 6.8 8.4" stroke={c} strokeWidth="1.2" strokeLinecap="round" fill="none" />
+        <circle cx="11.6" cy="12.8" r="1.5" stroke={c} strokeWidth="1.2" />
       </svg>
     )
   }

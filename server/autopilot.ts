@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   runBacktest,
   computeReport,
@@ -6,6 +7,7 @@ import {
   buildCandidateSet,
   contentHash,
   walkForward,
+  wfWidthFor,
   DEFAULT_GRID_EXEC,
 } from '../src/engine/index.ts'
 import type { Candle, Strategy, StrategyContext } from '../src/engine/index.ts'
@@ -13,6 +15,7 @@ import { DEFAULT_OVERFIT_THRESHOLDS, judgeOverfit } from '../src/engine/overfit.
 import type { OverfitOutcome } from '../src/engine/overfit.ts'
 import { atr as computeAtr } from '../src/engine/indicators.ts'
 import { appendEvent } from './ledger.ts'
+import { buildAcceptedFactorStrategies } from './factorStrategyService.ts'
 import { processLiveIntent, processOrderIntent } from './core.ts'
 import type { OrchState } from './types.ts'
 import { ATR_PERIOD, MIN_MARGIN_USDT, MIN_VIABLE_NOTIONAL_CEX_USDT, SPOT_MAX_LEVERAGE, TIME_STOP_HOURS, dailyLossLimit } from './riskConstants.ts'
@@ -20,7 +23,6 @@ import { assessEdge, liveCexCostInput } from './costModel.ts'
 import {
   applyStopAction,
   canScaleIn,
-  checkCooldown,
   closePosition,
   computeStopGeometry,
   evaluatePosition,
@@ -38,9 +40,11 @@ import { deriveStructureTarget, getRegime, refreshRegime, stopAtrFor } from './m
 import type { RegimeSnapshot } from './marketRegime.ts'
 import { runPipeline } from './interceptors.ts'
 import type { InterceptorContext, MarketPackage, TradeDecision } from './interceptors.ts'
+import { buildInterceptorContext, buildMarketPackage } from './tradeGate.ts'
 import { classifySnapshotObservability, pruneSnapshot } from './decisionObservability.ts'
 import type { Observability } from './decisionObservability.ts'
 import { getReservationManager } from './riskReservation.ts'
+import { normQty } from './intentLedger.ts'
 import { STATE_CONFIRMED, STATE_CLOSED, STATE_PENDING, STATE_REJECTED, STATE_UNKNOWN } from './riskReservation.ts'
 
 export type AutopilotStage = 'idle' | 'accumulating' | 'optimizing' | 'trading' | 'target_reached' | 'drawdown_stopped'
@@ -315,11 +319,70 @@ export type OverfitGate = (candles: readonly Candle[]) => OverfitGateOutcome
 /**
  * 自动驾驶的 walk-forward 切分。
  *
- * 与 `evidence.ts` 的 `DEFAULT_WF` 同值：960/240 在 2880 根上得 8 折。
- * `barMinutes` 取 15 同样是**跟随选择口径** —— `evaluateCandidateGrid(candles)` 默认 15，
+ * ★ 折宽**不再写死**，改为按数据长度调用 `wfWidthFor()` —— 与 `evidence.ts`
+ *   共用同一个函数（原先两处各写一份 960/240，是"同一个事实两份实现"）。
+ *
+ *   起因是一次实测：同一份行情、同一批候选，只把折宽从 960/240 改成
+ *   14400/4800，裁定就从 REJECT 翻成 PASS（赢家分位 0.547 → 0.774）。
+ *   折宽不是性能参数，它是 `minAvgWinnerW = 0.6` 这条判据的**适用条件** ——
+ *   那个阈值是在 8 折上标定的（见 overfit.ts 文件头），折数变了，
+ *   判据就不再是原来的判据。
+ *
+ * `barMinutes` 取 15 是**跟随选择口径** —— `evaluateCandidateGrid(candles)` 默认 15，
  * 门若用别的值，年化与每日笔数的换算就和选择时不一致，又是一次口径错位。
  */
-const AUTOPILOT_OVERFIT_WF = { trainBars: 960, testBars: 240, barMinutes: 15, slices: 10 }
+const AUTOPILOT_OVERFIT_SLICES = 10
+
+/**
+ * 生产候选池 —— **选择侧与门禁侧必须吃同一个**。
+ *
+ * 这两侧各拼一份候选场是本项目已经踩过的坑（F-47）：
+ * `optimize()` 用 A 批候选挑冠军，`defaultOverfitGate()` 用 B 批候选算 PBO，
+ * 于是"这次选择过拟合了吗"回答的其实是另一个问题，而两边都看不出异常。
+ * 因此这里只暴露**一个**构造函数，谁要候选谁调它。
+ *
+ * ★ 因子策略的来源是台账（`data/factors/strategies.json`），而
+ *   `buildAcceptedFactorStrategies()` 会**拒绝**行情指纹已变的行。
+ *   被拒的必须说出来：一条"因子明明接受了却没进候选池"的静默失效，
+ *   排查成本极高（台账显示 accepted，候选场里没有，两边都不报错）。
+ */
+export interface CandidatePool {
+  /** 手写策略网格。 */
+  handWritten: Strategy[]
+  /** 当前可用的因子策略（行情指纹与台账一致的那些）。 */
+  factor: Strategy[]
+  /** 合并结果 —— 选择与门禁都用它，不许各自拼。 */
+  all: Strategy[]
+  /** 没进池的因子策略，每条都带原因。 */
+  factorSkipped: Array<{ slug: string; reason: string }>
+}
+
+/**
+ * 最近一次候选池里的因子策略。
+ *
+ * `rebuildStrategy` 需要它：因子策略的重建参数（base/transform/window）
+ * 来自因子台账，**不在 `Strategy.params` 里**（那是个 `Record<string, number>`），
+ * 所以只能按 id 从这份快照里取回。
+ */
+let lastFactorStrategies: Strategy[] = []
+
+export function candidatePool(): CandidatePool {
+  const pick = buildAcceptedFactorStrategies()
+  const handWritten = buildCandidateSet()
+  lastFactorStrategies = pick.strategies
+  if (pick.skipped.length > 0) {
+    console.log(
+      `[autopilot] 因子策略未入池 ${pick.skipped.length} 条：` +
+        pick.skipped.map((s) => `${s.slug}(${s.reason})`).join(' · '),
+    )
+  }
+  return {
+    handWritten,
+    factor: pick.strategies,
+    all: [...handWritten, ...pick.strategies],
+    factorSkipped: pick.skipped,
+  }
+}
 
 function defaultOverfitGate(candlesIn: readonly Candle[]): OverfitGateOutcome {
   const t0 = Date.now()
@@ -327,11 +390,13 @@ function defaultOverfitGate(candlesIn: readonly Candle[]): OverfitGateOutcome {
   // 折数不足时 walkForward 返回 0 折凭据，judgeOverfit 自会判 UNVERIFIABLE。
   // 这里**不**再做一次「样本够不够」的前置判断：门槛只应存在于一处，
   // 否则两处阈值各自漂移，且「到底哪一处拒的」将无法从事由里分辨。
+  // 折宽按数据长度反推（唯一出处 wfWidthFor）—— 见 AUTOPILOT_OVERFIT_SLICES 的说明。
+  const width = wfWidthFor(series.length)
   const result = walkForward(
     series,
-    buildCandidateSet(),
-    { ...AUTOPILOT_OVERFIT_WF, exec: DEFAULT_GRID_EXEC },
-    { dataHash: contentHash(series), slices: AUTOPILOT_OVERFIT_WF.slices },
+    candidatePool().all,
+    { ...width, barMinutes: 15, exec: DEFAULT_GRID_EXEC },
+    { dataHash: contentHash(series), slices: AUTOPILOT_OVERFIT_SLICES },
   )
   const verdict = judgeOverfit(result.receipt, DEFAULT_OVERFIT_THRESHOLDS)
   return {
@@ -548,7 +613,7 @@ export async function onAutopilotBar(candle: Candle): Promise<void> {
 
   // 硬性回撤保护：先于一切目标逻辑
   if (pnlPct <= -AUTOPILOT_DRAWDOWN_PCT) {
-    await flatten('DRAWDOWN_PROTECTION')
+    await flatten('DRAWDOWN_PROTECTION', candle.t)
     running = false
     stage = 'drawdown_stopped'
     appendEvent('AUTOPILOT_DRAWDOWN_STOP', { pnlPct: Math.round(pnlPct * 100) / 100, limit: -AUTOPILOT_DRAWDOWN_PCT })
@@ -557,7 +622,7 @@ export async function onAutopilotBar(candle: Candle): Promise<void> {
 
   // 目标达成：平仓锁定 paper 收益
   if (stage === 'trading' && pnlPct >= targetPct) {
-    await flatten('TARGET_REACHED')
+    await flatten('TARGET_REACHED', candle.t)
     stage = 'target_reached'
     cycles += 1
     appendEvent('AUTOPILOT_TARGET_REACHED', { pnlPct: Math.round(pnlPct * 100) / 100, targetPct, cycles })
@@ -677,11 +742,14 @@ function optimize(): OptimizeResult {
     return { ok: true, id: pinned.id, strategy: pinned.strategy, fitness: pinned.fitness, fitnessVersion: pinned.fitnessVersion, overfit: null }
   }
   winnerPinned = false
-  const grid = evaluateCandidateGrid(candles)
+  // 候选场 = 手写网格 + 当前可用的因子策略。
+  // ★ 与 `defaultOverfitGate` 里那次 `candidatePool()` 是**同一个构造函数**。
+  const pool = candidatePool()
+  const grid = evaluateCandidateGrid(candles, 15, pool.factor)
   const best = grid[0]
   if (!best) return { ok: false, reason: 'empty grid' }
   // 因子族重建策略实例（策略为无状态工厂产物）
-  const rebuilt = rebuildStrategy(best.id.replace(/[:{"].*$/, ''), best.result.meta.params)
+  const rebuilt = rebuildStrategyFromId(best.id, best.result.meta.params)
   if (!rebuilt) return { ok: false, reason: `cannot rebuild ${best.id}` }
 
   // ── F-47：选择必须过过拟合门 ──────────────────────────────────────
@@ -743,8 +811,41 @@ function optimize(): OptimizeResult {
   }
 }
 
+/**
+ * 从候选 id 重建策略实例。
+ *
+ * ★ 旧写法 `id.replace(/[:{"].*$/, '')` 是「遇第一个冒号就截断」。
+ *   它对 `macross:{"fast":5,"slow":20}` 恰好正确，但因子策略的 id 是
+ *   `factor:price_volume_corr_raw_4:{"sign":-1,...}` —— **id 里本身含冒号**，
+ *   截出来只剩 `factor`，rebuildStrategy 认不出，autopilot 直接给出
+ *   `cannot rebuild`。那是一个"因子策略一旦夺冠就静默失败"的坑：
+ *   表现是自动挖掘永远返回失败，而日志里只有一句看不出因果的理由。
+ *   正确做法：id 的最后一段是 JSON 参数，从**最后一个** `:{` 处切。
+ *
+ * 顺带核对 id 里的参数与回测元数据是否一致。不一致说明 id 与结果来自
+ * 不同的候选，那时"重建出来的策略"和"被选中的那个"是两个东西 ——
+ * 而它不报错，只是拿另一个策略去下单。
+ */
+function rebuildStrategyFromId(id: string, paramsFromResult: Record<string, number>): Strategy | null {
+  const m = /^(.*):(\{.*\})$/.exec(id)
+  if (!m) return null
+  let parsed: Record<string, number>
+  try {
+    parsed = JSON.parse(m[2]) as Record<string, number>
+  } catch {
+    return null
+  }
+  if (JSON.stringify(parsed) !== JSON.stringify(paramsFromResult)) return null
+  return rebuildStrategy(m[1], parsed)
+}
+
 function rebuildStrategy(family: string, params: Record<string, number>): Strategy | null {
   const mod = engineRef
+  // 因子策略：定义（base/transform/window）来自因子台账，**不在 params 里**，
+  // 所以只能从最近一次候选池里按 id 取回。
+  if (family.startsWith('factor:')) {
+    return lastFactorStrategies.find((s) => s.id === family) ?? null
+  }
   if (family === 'macross') return mod.maCrossStrategy(params.fast ?? 10, params.slow ?? 30)
   if (family === 'rsi-rev') return mod.rsiReversionStrategy(params.period ?? 14, params.lower ?? 30, params.upper ?? 70)
   if (family === 'breakout') return mod.breakoutStrategy(params.period ?? 20)
@@ -890,10 +991,62 @@ function reconcileGuardWithLedger(s: OrchState, price: number, stopAtr: number, 
  *
  * 把 paper / live 两条路径的差异收在一处，是为了避免「新加的风控只挂了其中一条通路」——
  * 本项目历史上就出现过 live 有策略身份校验、paper 没有的隐性不对称。
+ *
+ * ── ★★ `bucket` 参数：这是幂等的**全部依据**（2026-09-22 加）──────────────
+ *
+ * **必须传"这根 K 线的时间戳"**，不能省、不能传 `Date.now()`。
+ * 理由见 `server/intentLedger.ts` 顶部：幂等的判据是**语义键**，
+ * 而语义键里唯一区分"这一次决策"与"下一次决策"的成分就是 bucket。
+ *
+ *   · 传 K 线时间戳 ⇒ 同一根 K 线上重复触发同一个信号 ⇒ 算出同一个键 ⇒ **挡住**（这正是要的）
+ *   · 传 `Date.now()` ⇒ 每次都不一样 ⇒ 等于没做幂等（**改造前的实际行为**）
+ *
+ * ★ 为什么 id 也从"随机"改成"由 bucket 派生"：场所（Binance/OKX）对
+ *   `newClientOrderId` / `clOrdId` **重复即拒**。id 与语义键必须同源，
+ *   否则会出现"语义上该挡、但场所先按 id 拒了"这种两套口径
+ *   （判据 8：同一业务动作只能有一条实现路径）。
+ *   ★ 顺带修掉旧 id 生成器的**误挡**缺陷：`Math.random().toString(36).slice(2,5)`
+ *     只有 3 位后缀，同一毫秒批量下单时按生日悖论会撞 id（实测碰撞率 **0.040%**），
+ *     撞了就有一笔**合法单**被误判成重复而拒掉。改为 bucket 派生后不再随机。
  */
-async function submitOrder(side: 'buy' | 'sell', qty: number): Promise<{ ok: boolean; reason?: string }> {
+function intentBucket(barTs: number): string {
+  return `${SYMBOL}:${barTs}`
+}
+
+/**
+ * 由语义键派生 `clientOrderId`。
+ *
+ * ★★ 为什么 id 必须**确定性**（不是"好看"或"方便排查"）：
+ * 场所（Binance 的 `newClientOrderId` / OKX 的 `clOrdId`）对**重复 id 直接拒单**。
+ * 这意味着 id 承担着第二道幂等防线 —— 但只有当"同一次决策重试得到同一个 id"时
+ * 这道防线才存在。旧的 `Date.now()+Math.random()` 每次都不同，
+ * 等于**把场所那道防线也一起废掉了**（而且废得很隐蔽：日志里 id 看着很"正常"）。
+ *
+ * ★ 长度：Binance 限 ≤36 字符、OKX 限字母数字且 ≤32。
+ *   取 sha256 前 20 位十六进制 —— 对"同一根 K 线上的十几次重试"这个量级，
+ *   碰撞概率可忽略（2^80 空间），且远在两端限制之内。
+ * ★ `tag` 参与哈希：同一根 K 线上既可能止损又可能加仓，
+ *   它们是**两笔不同的意图**，不该互相顶替（否则一个被挡，另一个也发不出去）。
+ */
+function makeClientOrderId(bucket: string, side: string, qty: number, tag: string): string {
+  return (
+    'ap' +
+    createHash('sha256')
+      .update(`${bucket}|${side}|${normQty(qty)}|${tag}`)
+      .digest('hex')
+      .slice(0, 20)
+  )
+}
+
+async function submitOrder(
+  side: 'buy' | 'sell',
+  qty: number,
+  bucket: string,
+  tag: string,
+): Promise<{ ok: boolean; reason?: string }> {
   if (!(qty > 0)) return { ok: false, reason: 'INVALID_QTY' }
-  const clientOrderId = `ap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`
+  // id 由语义键派生：**同一次决策重试得到同一个 id**，场所侧也因此能认出重复。
+  const clientOrderId = makeClientOrderId(bucket, side, qty, tag)
 
   if (isAutopilotLive()) {
     const instType = autopilotInstType()
@@ -962,7 +1115,7 @@ async function tradeBar(lastIdx: number): Promise<void> {
       const isStopHit = action.trigger === 'stop_hit'
       const exitSide: 'buy' | 'sell' = guarded.side === 'long' ? 'sell' : 'buy'
       const qty = round5(Math.abs(guarded.qty))
-      const outcome = await submitOrder(exitSide, qty)
+      const outcome = await submitOrder(exitSide, qty, intentBucket(candle.t), 'stop_close')
       if (!outcome.ok) {
         // 平仓被拒是严重信号：持仓失去守护。如实记录，不改止损，下一根 K 线重试。
         appendEvent('AUTOPILOT_ORDER_REJECTED', { reason: outcome.reason, side: exitSide, context: action.trigger })
@@ -1006,7 +1159,7 @@ async function tradeBar(lastIdx: number): Promise<void> {
     if (guarded && guarded.side === 'long') {
       const frac = Math.min(Math.max(d.frac, 0), 1)
       const qty = round5(Math.abs(guarded.qty) * frac)
-      const outcome = await submitOrder('sell', qty)
+      const outcome = await submitOrder('sell', qty, intentBucket(candle.t), 'strategy_exit')
       if (!outcome.ok) {
         appendEvent('AUTOPILOT_ORDER_REJECTED', { reason: outcome.reason, side: 'sell', context: 'strategy_exit' })
         return
@@ -1050,7 +1203,7 @@ async function tradeBar(lastIdx: number): Promise<void> {
       const sizing = sizePositionFromRisk(equity, price, geometry.distance, existingNotional, autopilotLeverage())
       const addQty = round5(sizing.qty)
       if (addQty > 0) {
-        const outcome = await submitOrder('buy', addQty)
+        const outcome = await submitOrder('buy', addQty, intentBucket(candle.t), 'scale_in')
         if (outcome.ok) {
           const newQty = round5(guarded.qty + addQty)
           const newEntry = round2((guarded.entryPrice * guarded.qty + price * addQty) / newQty)
@@ -1076,7 +1229,7 @@ async function tradeBar(lastIdx: number): Promise<void> {
   }
   if (guarded) return // 存在反向持仓，交由 core 的持仓冲突逻辑处理，不在此处反向
 
-  await tryOpenLong(price, equity, regime, stopAtr, atrSource, s, now)
+  await tryOpenLong(price, equity, regime, stopAtr, atrSource, s, now, candle.t)
 }
 
 /**
@@ -1094,6 +1247,7 @@ async function tryOpenLong(
   atrSource: string,
   s: OrchState,
   now: number,
+  barTs: number,
 ): Promise<void> {
   if (!winner) return
 
@@ -1115,7 +1269,11 @@ async function tryOpenLong(
     strategyId: `${winner.id}:${JSON.stringify(winner.params)}`,
   }
 
-  const pkg: MarketPackage = {
+  // ★ 闸门输入改由 `tradeGate.ts` 的共享构造函数产出。
+  //   理由不是"少写几行"，而是：交易大厅（人工下单）现在要用**同一条**闸门，
+  //   而它必须读**同一份** pkg/ctx 语义。两份构造一定会漂移，漂移之后
+  //   自治循环拒绝开仓、交易大厅照常放行，两边还都宣称读的是"同一份行情"。
+  const pkg: MarketPackage = buildMarketPackage({
     symbol: SYMBOL,
     dataQuality: candles.length >= MIN_BARS ? 'valid' : 'insufficient',
     price,
@@ -1124,20 +1282,17 @@ async function tryOpenLong(
     adx1h: regime?.adx1h,
     macroTrend: regime?.macroTrend ?? 'RANGE',
     macroTrendSource: regime?.macroTrendSource ?? '高周期不可用',
-  }
+  })
 
-  const cooldown = checkCooldown(SYMBOL, 'long', now)
-  const openGuard = getPosition(SYMBOL)
-  const context: InterceptorContext = {
+  const context: InterceptorContext = buildInterceptorContext({
+    symbol: SYMBOL,
+    side: 'long',
     now,
     equity,
     killswitch: s.killswitch,
-    openPositions: openGuard ? [{ symbol: SYMBOL, side: openGuard.side }] : [],
-    cooldownBlocked: cooldown.blocked,
-    cooldownReason: cooldown.reason,
     dailyLoss: dailyRealizedLoss,
     dailyLossLimit: dailyLossLimit(equity),
-  }
+  })
 
   const result = runPipeline(pkg, decision, context)
 
@@ -1319,7 +1474,7 @@ async function tryOpenLong(
     return
   }
 
-  const outcome = await submitOrder('buy', qty)
+  const outcome = await submitOrder('buy', qty, intentBucket(barTs), 'open')
 
   if (!outcome.ok) {
     // 关键判断：下单失败**不等于**没建仓。只有「场所明确拒绝」才能释放预算；
@@ -1414,7 +1569,7 @@ async function tryOpenLong(
  *
  * 现在按单笔上限**切片多次提交**，只有全部成交才清零；任何一片失败即停止并如实记录剩余量。
  */
-async function flatten(reason: string): Promise<void> {
+async function flatten(reason: string, barTs: number): Promise<void> {
   const guard = getPosition(SYMBOL)
   const startQty = Math.abs(apPosQty) > 1e-9 ? Math.abs(apPosQty) : Math.abs(guard?.qty ?? 0)
   if (!deps || startQty < 1e-9) return
@@ -1435,10 +1590,19 @@ async function flatten(reason: string): Promise<void> {
   let sent = 0
   let chunks = 0
 
+  // ★ `targetQty` 参与 tag：同一根 K 线上的每一次重试目标量相同 ⇒ 得到同一个键 ⇒ 被台账/场所挡住，
+  //   这正是要的（"同一根 bar 上重复触发平仓"在语义上就是同一笔）。
+  //   而 `chunks` **刻意不参与** —— 理由：分批平仓的每一片都是**同一个平仓决策**的切片，
+  //   若按片区分则「第 1 片已成功、第 2 片超时」重试时第 1 片会被**再发一次**（超发）。
+  //   代价是：中断后重试会从"第一片"重新开始，于是前几片会得到 `settled` 而**在网关侧被跳过**，
+  //   真正的进展从"第一片未发出的那个数量"接续 —— 与 `remaining` 语义一致，**不会超发**。
+  const flatTargetQty = round5(startQty)
+  const flatBucket = `flatten:${reason}@${intentBucket(barTs)}`
+
   while (remaining > 1e-5 && chunks < maxChunks) {
     const slice = round5(Math.min(remaining, perOrderCap))
     if (slice <= 0) break
-    const outcome = await submitOrder(side, slice)
+    const outcome = await submitOrder(side, slice, flatBucket, `flatten:${flatTargetQty}`)
     if (!outcome.ok) {
       appendEvent('AUTOPILOT_FLATTEN_PARTIAL', {
         scope: isAutopilotLive() ? 'live' : 'paper',

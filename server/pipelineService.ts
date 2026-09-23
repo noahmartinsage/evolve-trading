@@ -30,6 +30,18 @@ export interface LiveIntentInput extends OrderIntentInput {
   strategyId: string
   mode?: 'paper' | 'live'
   leverage?: number
+  /**
+   * 业务桶 —— **幂等语义键里唯一区分"这一次决策"与"下一次决策"的成分**。
+   *
+   * 自治循环传的是**当前 K 线的时间戳**（`${SYMBOL}:${barTs}`）。
+   * 语义与理由见 `server/intentLedger.ts` 顶部；这里只强调一条：
+   * **不要传 `Date.now()`** —— 那等于把随机性放进幂等键，
+   * 会让去重永远不命中（改造前用随机 clientOrderId 就是这个效果）。
+   *
+   * ★ 可选：不传时网关退回"每次算一个新键"（不会误挡，但也失去防重能力）。
+   *   live 主路径**必须**传。
+   */
+  bucket?: string
 }
 
 export type LiveAuth =

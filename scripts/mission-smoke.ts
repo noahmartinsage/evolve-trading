@@ -73,6 +73,8 @@ import {
   resetStartConsent,
 } from '../server/mission/consent.ts'
 import { missionStepsConsistent, overfitState, planMission } from '../server/mission/service.ts'
+// 任务页那三条例句住在 src/ 里（它是题面，得被界面 import）。S-M3b 直接拿它来喂裁定器。
+import { MISSION_EXAMPLES } from '../src/pages/missionExamples.ts'
 import type { MissionEnv } from '../server/mission/types.ts'
 
 /**
@@ -274,6 +276,35 @@ async function main(): Promise<void> {
     // 三条支路的结论必须两两不同 —— 否则"三态"只是三个名字
     assertEq('S-M3 三态互不相同', new Set([v1.verdict, v2.verdict, v3.verdict]).size, 3)
     pass('S-M3 三态裁定', '证据不足 / 不可行 / 可行 三条支路各命中一次；证据不足的理由必须是 hold 而非 block')
+  }
+
+  // ══════════ S-M3b 任务页的三条例句：题面与判据不许分岔 ══════════
+  //
+  // ★ 这条防的是一件**已经在真实界面上发生过**的事：任务页的三条例句原本
+  //   全部落在"做不成"（10 倍/1 天 · 沙盒 · 3 天翻倍），而那一页的注释写着
+  //   "三个示例刻意各指向一条支路"。用户第一次进来点完三个例句 ⇒ 三次"这也不行"
+  //   ⇒ 唯一合理的结论是"这一页坏了"（判据 D7：这个输出把用户引向哪个动作）。
+  //
+  // ★ 为什么这条断言必须**真的喂进裁定器**，而不是写在示例文件旁边的注释里：
+  //   例句的结论是**判据的函数**（目标上限、场所接线、阈值）。改其中任何一个，
+  //   结论都会变，而页面本身看起来完全正常 —— 注释不会报红，只有断言会。
+  {
+    const rows = MISSION_EXAMPLES.map((text) => {
+      const spec = parseGoal(text, goalCtx())
+      return { text, isMission: looksLikeMission(spec), verdict: assessMission(spec, baseEnv()).verdict }
+    })
+    // 前提：三句都得先被认出来是"任务"。少了这条，下面可能在断言三坨噪声。
+    assertEq('S-M3b 三条例句都像任务', rows.filter((r) => r.isMission).length, MISSION_EXAMPLES.length)
+    assertEq('S-M3b 三条例句三态互不相同', new Set(rows.map((r) => r.verdict)).size, MISSION_EXAMPLES.length)
+    // ★ 把每一句的结论写进失败信息：题面一改，看到红的人要**立刻**知道该改哪一句，
+    //   而不是自己去把三句话各跑一遍。
+    const detail = rows.map((r) => `${r.verdict} ← ${r.text}`).join(' ｜ ')
+    assertTrue(
+      'S-M3b 可行 / 证据不足 / 做不成 三态齐全',
+      ['feasible', 'unverifiable', 'infeasible'].every((v) => rows.some((r) => r.verdict === v)),
+      detail,
+    )
+    pass('S-M3b 任务页例句各指一条支路', detail)
   }
 
   // ══════════════ S-M4 场所名与适配器逐字一致 ══════════════
@@ -580,7 +611,7 @@ async function main(): Promise<void> {
 
     const r = await handleUtterance(GOAL_TEXT)
     assertEq('S-M13 轮次意图', r.intent, 'start_mission')
-    assertTrue('S-M13 不是"没听懂"', !r.reply.includes('这句我没听懂'), '任务句被回成了听不懂：' + r.reply)
+    assertTrue('S-M13 不是"没听懂"', !r.reply.includes('这句我没听懂'), '任务句被回成了听不懂：' + r.reply) // 「任务已启动」那一支的文案不会引用兜底话术，也没有它的否定式引用
     assertTrue('S-M13 回话非空', r.reply.length > 20, '回话太短：' + r.reply)
     assertTrue(
       'S-M13 回话说明了硬矛盾',
@@ -741,7 +772,7 @@ async function main(): Promise<void> {
     //    给一个有硬矛盾的目标配口令，等于配了一把能开一扇不存在的门的钥匙。
     const bad = planMission(GOAL_TEXT, goalCtx())
     assertEq('S-M15 不可行不签发口令', bad.consent, null)
-    assertTrue('S-M15 不可行不提口令', !bad.spoken.includes('口令'), '不可行的回话里出现了口令，用户会以为可以强行启动')
+    assertTrue('S-M15 不可行不提口令', !bad.spoken.includes('口令'), '不可行的回话里出现了口令，用户会以为可以强行启动') // negation-ok: 这里的否定式本身就是缺陷：「不签发口令」同样会让人以为可以强启，所以这句刻意保留
 
     // ② 可行才签发。场所夹具用 env 显式钉死，避免"本机恰好设了 VENUE"导致结果漂移。
     const prevVenue = process.env.VENUE

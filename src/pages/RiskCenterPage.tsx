@@ -284,7 +284,7 @@ export default function RiskCenterPage() {
             <i className="rc-dot" />
             {online ? '已接入编排器' : '编排器离线'}
           </span>
-          <button className="rc-btn primary" disabled={!online || busy === 'sandbox'} onClick={onRunSandbox}>
+          <button className="rc-btn primary" data-ui="risk.sandbox.run" disabled={!online || busy === 'sandbox'} onClick={onRunSandbox}>
             {busy === 'sandbox' ? '自检中…' : '⚡ 一键沙箱自检'}
           </button>
         </div>
@@ -446,7 +446,7 @@ export default function RiskCenterPage() {
               <button className="rc-btn" disabled={dirtyKeys.length === 0} onClick={() => setDraft({})}>
                 放弃改动
               </button>
-              <button className="rc-btn primary" disabled={dirtyKeys.length === 0 || !!busy} onClick={onSaveParams}>
+              <button className="rc-btn primary" data-ui="risk.params.save" disabled={dirtyKeys.length === 0 || !!busy} onClick={onSaveParams}>
                 {busy === 'save' ? '写入中…' : `保存并生效（${dirtyKeys.length}）`}
               </button>
             </div>
@@ -710,7 +710,7 @@ export default function RiskCenterPage() {
                 onChange={(e) => setNewRule(e.target.value)}
               />
 
-              <button className="rc-btn primary" disabled={!online || !!busy} onClick={onSubmitLesson}>
+              <button className="rc-btn primary" data-ui="risk.lesson.submit" disabled={!online || !!busy} onClick={onSubmitLesson}>
                 {busy === 'lesson' ? '提交中…' : '提交并校验'}
               </button>
 

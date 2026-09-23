@@ -29,3 +29,12 @@ _*.mjs
 *.db
 *.db-shm
 *.db-wal
+
+# laya 本地部署虚拟环境
+laya-local/.venv/
+
+# 本地回收站（变异测试备份 / smoke 临时库，不入库）
+.trash/
+
+# 本地开发工具配置（含本机绝对路径，不入库）
+.claude/

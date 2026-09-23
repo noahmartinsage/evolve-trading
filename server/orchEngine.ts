@@ -19,6 +19,10 @@ interface IntentMeta {
     price?: number
     qty: number
     strategyId?: string
+    /** 止盈**绝对价**（见 `protection.ts`：存价不存比例，比例会随标记价漂移）。 */
+    takeProfit?: number
+    /** 止损**绝对价**。 */
+    stopLoss?: number
   }
   orchOrder: OrchOrder
 }
@@ -39,6 +43,7 @@ export function createState(startingBalance = 100_000): OrchState {
     equityCurve: [],
     risk: { ...DEFAULT_RISK },
     submitTimestamps: [],
+    protection: new Map(),
   }
 }
 
@@ -161,6 +166,21 @@ function applyFillAccounting(
   }
 }
 
-export function markPriceOf(state: OrchState, symbol: string): number {
-  return state.lastPrice.get(symbol) ?? 0
+/**
+ * 标记价。**没有真实报价时返回 `null`，不返回 0。**
+ *
+ * ★★ 2026-09-22 修（红线㉟ 的直接违反，用户报「报价总是出错」）：
+ *   原来这里是 `state.lastPrice.get(symbol) ?? 0`。返回 0 的后果不只是"显示错"：
+ *   `preTradeCheck` 用 `refPrice * qty` 算名义额 ⇒ 0 × qty = 0，
+ *   于是 `maxNotionalPerOrder` 这道上限**在任何品种上都永远不超限**
+ *   —— 一道风控门被静默拆掉了，而它在日志里看不出来（没有任何一处会红）。
+ *
+ * ★ `null` 与 `0` 在调用方必须走**不同**分支：前者是"不知道"，后者是"价格就是零"
+ *   （加密资产价格不可能是 0，所以 0 在这里永远是伪装成数据的缺省值）。
+ *   调用方要求：拿不到报价就**拒单并说明**，不要按 0 定价、不要按 0 折算权益。
+ */
+export function markPriceOf(state: OrchState, symbol: string): number | null {
+  const px = state.lastPrice.get(symbol)
+  if (px === undefined || !Number.isFinite(px) || px <= 0) return null
+  return px
 }

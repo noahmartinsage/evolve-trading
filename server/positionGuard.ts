@@ -240,6 +240,23 @@ export interface LiquidationGeometry {
 }
 
 /**
+ * 强平几何里那个**与杠杆无关、与止损无关**的常数项：维持保证金率 + 费率缓冲。
+ *
+ * ★ 为什么必须是一个函数而不是各算各的：它同时出现在**正函数**
+ *   （`maxSafeLeverageDetail`：由止损求倍数）与**反函数**
+ *   （`stopPctBoundForLeverage`：由倍数求止损；`leverageForLiquidationDistance`：由距离求倍数）里。
+ *   抄成两份一定会在某次调参后分岔 —— 本文件 336 行早就写过这句警告，
+ *   而 2026-09-22 确实分岔过一次：`voice/leverageGuard` 手抄的逆函数**漏了这一项**，
+ *   把「125 倍需要止损 ≤0.0667%」念成了 **0.533%**（差 8 倍），
+ *   用户照着念出来的数去收窄止损，**仍然下不出去**（实测复现，见 §3.48）。
+ */
+function maintPlusFee(): number {
+  const maint = clamp(LIQUIDATION_MAINT_MARGIN_PCT, 0, 0.5)
+  const fee = Math.max(LIQUIDATION_FEE_BUFFER_BPS, 0) / 10_000
+  return maint + fee
+}
+
+/**
  * 由入场价、方向、杠杆推出强平价（逐仓/全仓近似式）。
  *
  * 公式（忽略资金费，费率以缓冲项单独扣）：
@@ -260,13 +277,34 @@ export function liquidationGeometry(
   const lev = levScale(leverage)
   if (lev <= 1) return { price: 0, distancePct: 0 }
 
-  const maint = clamp(LIQUIDATION_MAINT_MARGIN_PCT, 0, 0.5)
-  const fee = Math.max(LIQUIDATION_FEE_BUFFER_BPS, 0) / 10_000
-  const raw = 1 / lev - maint - fee
+  const raw = 1 / lev - maintPlusFee()
   const distancePct = Math.max(raw, 0)
 
   const price = side === 'long' ? entryPrice * (1 - distancePct) : entryPrice * (1 + distancePct)
   return { price, distancePct }
+}
+
+/**
+ * **未钳制**的强平距离 —— 只用来回答「你说的那个倍数下会怎样」。
+ *
+ * ── 为什么必须与 `liquidationGeometry` 分开 ───────────────────────────
+ * `liquidationGeometry` 内部走 `levScale()`，而 `levScale` 会把倍数钳到
+ * `MAX_LEVERAGE`（默认 3）。那个钳制对**风控裁决**是正确的 —— 3 就是实际会用的倍数。
+ * 但拿它去**说明**高倍请求，就会印出一个假数：
+ *
+ *   用户要 125 倍 → liquidationGeometry(entry, 'long', 125)
+ *   → 内部钳成 3 → 返回 32.63%
+ *   → 回话印成「在 125 倍下强平距离只有 32.63%」
+ *
+ * 而 125 倍的真实距离是 0.10%（毛口径 0.80%）。**印出来的数把危险说成了安全**，
+ * 方向恰好相反 —— 用户看到 32% 会以为 125 倍很稳，实际上止损根本等不到。
+ *
+ * 所以：裁决用钳制值（谁生效就用谁），**说明必须用未钳制值**（说的是哪个倍数就用哪个倍数）。
+ * 判据 25：同一个数字在"我按 3 倍算"和"我说的是 125 倍"下长得一样，而它指的下一步动作相反。
+ */
+export function liquidationDistancePctUnclamped(leverage: number): number {
+  if (!Number.isFinite(leverage) || leverage <= 1) return 0
+  return Math.max(1 / leverage - maintPlusFee(), 0)
 }
 
 /**
@@ -312,10 +350,8 @@ export interface SafeLeverageDetail {
  */
 export function maxSafeLeverageDetail(stopPct: number): SafeLeverageDetail {
   if (!(stopPct > 0)) return { raw: 0, applied: 1, ceiling: 'geometry' }
-  const maint = clamp(LIQUIDATION_MAINT_MARGIN_PCT, 0, 0.5)
-  const fee = Math.max(LIQUIDATION_FEE_BUFFER_BPS, 0) / 10_000
   const mult = Math.max(LIQUIDATION_SAFETY_MULT, 1)
-  const denom = stopPct * mult + maint + fee
+  const denom = stopPct * mult + maintPlusFee()
   if (!(denom > 0)) return { raw: LEVERAGE_HARD_CEILING, applied: LEVERAGE_HARD_CEILING, ceiling: 'hard-ceiling' }
   const raw = 1 / denom
   const byConfig = Math.min(MAX_LEVERAGE, LEVERAGE_HARD_CEILING)
@@ -323,6 +359,45 @@ export function maxSafeLeverageDetail(stopPct: number): SafeLeverageDetail {
   const ceiling: SafeLeverageDetail['ceiling'] =
     raw > byConfig ? (MAX_LEVERAGE > LEVERAGE_HARD_CEILING ? 'hard-ceiling' : 'config') : 'geometry'
   return { raw: Math.floor(raw * 100) / 100, applied, ceiling }
+}
+
+/**
+ * `maxSafeLeverageDetail` 的**精确反函数**：给定目标倍数，反解它要求的止损**上确界**。
+ *
+ * 由 `1/L = stopPct × mult + b` 解出 `stopPct = (1/L − b) / mult`，其中 `b = maintPlusFee()`。
+ *
+ * ★ 为什么必须住在同一个文件：本文件 336 行自己写着「公式只有这一份，
+ *   `maxSafeLeverage` 是本函数的薄封装。抄第二份就一定会在某次调参后与真身分岔」。
+ *   而 `voice/leverageGuard` 当时正是抄了一份**不完整**的逆（漏掉 `b`）——
+ *   把 125 倍所需的 0.0667% 念成了 0.533%，**差 8 倍**，用户照着做仍被拒。
+ *   2026-09-22 实测复现（探针 + `scripts/contract-order-smoke.ts` 的往返断言）。
+ *
+ * ★ 返回的是**上确界**（`raw` 恰好等于该倍数的那个不动点），不是"差不多能过"的数。
+ *   调用方若要把它**念给用户**，必须**向下取整到它即将念出的精度**：
+ *   上确界 0.066667% 四舍五入到 3 位 = 0.067% ⇒ 几何只给 124.92 倍，用户照做**仍被拒**；
+ *   向下取整到 0.066% ⇒ 125.15 倍，才真的过得去。这条往返性质由冒烟测试钉住。
+ *
+ * 返回 0 表示**不存在**可用的止损宽度：该倍数下 `1/L ≤ b`，
+ * 即价格还没走出维持保证金+费率就已经爆仓，任何止损都救不了。
+ */
+export function stopPctBoundForLeverage(leverage: number): number {
+  if (!Number.isFinite(leverage) || leverage <= 1) return 1
+  const mult = Math.max(LIQUIDATION_SAFETY_MULT, 1)
+  const raw = (1 / leverage - maintPlusFee()) / mult
+  return raw > 0 ? raw : 0
+}
+
+/**
+ * `liquidationDistancePctUnclamped` 的**反函数**：给定强平距离，反解对应的倍数。
+ *
+ * 用途是把「强平距离要多少才算远」翻译成「倍数最多到几」——
+ * 于是那句"要么给止损、要么降倍数"里被要求降到的那个数**是从几何算出来的**，
+ * 而不是另写一个字面量（否则它也会分岔，见上）。
+ */
+export function leverageForLiquidationDistance(distancePct: number): number {
+  const d = (Number.isFinite(distancePct) ? distancePct : 0) + maintPlusFee()
+  if (!(d > 0)) return LEVERAGE_HARD_CEILING
+  return 1 / d
 }
 
 export interface LiquidationVerdict {

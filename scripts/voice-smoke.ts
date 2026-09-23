@@ -15,12 +15,16 @@
  * 反例（不该发生的）与正例成对出现，是这个仓库里被反复验证过的做法：
  * 一个只会变绿的检查，等价于没有检查。
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resetOrch, seedPrice, processOrderIntent, getOrchState } from '../server/core.ts'
 import { appendEvent, getEvents, resetLedger } from '../server/ledger.ts'
 import { resetSurveillance } from '../server/surveillance.ts'
-import { parseIntent } from '../server/voice/intents.ts'
+import { isDangerous, parseHorizonMinutes, parseIntent } from '../server/voice/intents.ts'
+// ★ 失败三态的判据与文案都住在这里（模块级唯一一份）—— 测试直接断言那一份，
+//   而不是另写一段"长得像"的判断（判据：判据只写一份）。
+import { modelFailureKind, modelFailureSpeech } from '../server/voice/model.ts'
 import { parseChineseNumber, extractAmount, resolveAmount } from '../server/voice/numerals.ts'
 import { VOICE_CATALOG, DEFAULT_VOICE_ID, resolveVoiceRequest, getVoice, voicesByEngine } from '../server/voice/voices.ts'
 import { NEURAL_VOICES, getNeuralVoice } from '../server/voice/tts.ts'
@@ -41,7 +45,17 @@ import {
   observeTick as observeNarratorTick,
 } from '../server/voice/narrator.ts'
 import { observeTick, configureAnomaly, resetAnomaly, anomalyCounters } from '../server/voice/anomaly.ts'
-import { createPending, getPending, beginTurn, commitReply, currentGeneration, sessionStatus, resetSession } from '../server/voice/session.ts'
+import { createPending, getPending, beginTurn, commitReply, currentGeneration, sessionStatus, resetSession, interrupt, sessionId } from '../server/voice/session.ts'
+// 对话记录（Task #114）：事实源与读取投影。
+import {
+  setTranscriptRoot,
+  transcriptRoot,
+  transcriptHealth,
+  resetTranscriptHealth,
+  readTranscript,
+  recordUserTurn,
+  recordAssistantTurn,
+} from '../server/voice/transcript.ts'
 import {
   handleUtterance,
   interruptVoice,
@@ -56,6 +70,22 @@ import {
   resetTtsStats,
   neuralFailureReason,
 } from '../server/voice/service.ts'
+// S14：系统实况（三态）与能力注册表（工具层）。
+// 注意这里**直接引 awareness/tools** 而不是通过 service —— 测的是它们自己的判据，
+// 不是"经由某个上层入口能不能跑通"。
+import {
+  fleetPnlVerdict,
+  fleetStandings,
+  labOverview,
+  speakFleet,
+  speakLab,
+  speakSituation,
+  standingsSourceOf,
+  situation,
+} from '../server/voice/awareness.ts'
+import { auditToolRegistry, inferLessonCategory, VOICE_TOOLS, type VoiceTool } from '../server/voice/tools.ts'
+import { loadLessons } from '../server/evolutionShield.ts'
+import { PROMOTION_STAGE_LABEL, PROMOTION_STAGE_RANK } from '../src/engine/promotion.ts'
 
 interface Scenario {
   name: string
@@ -101,6 +131,21 @@ const SYMBOLS = ['BTCUSDT', 'ETHUSDT']
 const CTX = { symbols: SYMBOLS, markPrice: () => MARK }
 
 async function main(): Promise<void> {
+  /**
+   * ★★ 第一件事：把对话记录根指到临时目录。
+   *
+   * 为什么必须放在**最前面**（而不是放到最后一组 T 里）：这个文件后面有
+   * S11「端到端 5 轮真实问答」，它真的会调 `handleUtterance`。那时如果
+   * 根还是默认的 `process.cwd()`，这 5 轮假对话就直接写进用户的
+   * **真实聊天记录**，而且它们和真的对话在界面上长得一模一样。
+   *
+   * 这不是假想：初版就只在最后一组 T 里隔离，实测在 data/voice 下留下
+   * 了 249 行假记录（三个测试进程各 82 行）。T22 是为此加的反回归断言。
+   */
+  const transcriptTmp = mkdtempSync(join(tmpdir(), 'evolve-transcript-'))
+  setTranscriptRoot(transcriptTmp)
+  resetTranscriptHealth()
+
   resetLedger()
   resetSurveillance()
   resetSession()
@@ -138,6 +183,22 @@ async function main(): Promise<void> {
       { text: '你是谁', intent: 'introduce' },
       { text: '帮助', intent: 'help' },
       { text: '今天天气怎么样', intent: 'unknown' },
+      // ── 解释性提问 vs 问行情（配对断言，两条缺一不可）────────────────────
+      //
+      // ★ 背景：实测「资金费率是怎么影响永续合约价格的？」因为含"价格"二字
+      //   被当成查行情，系统回的是「还没收到行情」—— 用户看不出那是"没数据"
+      //   还是"它压根没听懂"（第三族失败：没读懂被伪装成读懂了）。
+      //   修法是给 query_market 加一条疑问句保护。
+      //
+      // ★ 但保护本身极易写成"对正确输入报错"：第一版用裸 /(怎么|如何)/ 做判据，
+      //   当场把最基础的「行情怎么样」也挡在外面（本烟测的 S1b 抓到的）。
+      //   所以这里必须**成对**钉住：解释性的交给模型，直白的仍然是问行情。
+      { text: '行情怎么样', intent: 'query_market' },
+      { text: '比特币价格是多少', intent: 'query_market' },
+      { text: '比特币现价多少', intent: 'query_market' },
+      // 这句期望 unknown = 规则层判不出来，会被兜底交给大模型（返回时意图标成 ask_model）
+      { text: '资金费率是怎么影响永续合约价格的', intent: 'unknown' },
+      { text: '比特币价格为什么跌了', intent: 'unknown' },
     ]
     for (const c of cases) {
       const got = parseIntent(c.text, CTX).intent
@@ -145,7 +206,7 @@ async function main(): Promise<void> {
     }
     pass(
       'S1 意图解析',
-      `${cases.length} 条中文口令逐条命中预期意图（含 1 条应判为 unknown 的反例）`,
+      `${cases.length} 条中文口令逐条命中预期意图（含 3 条该交给模型的解释性提问，以及与它们配对的两条真·问行情）`,
     )
   }
 
@@ -276,14 +337,41 @@ async function main(): Promise<void> {
 
   // ══════════════════ S3 语音下单必须过同一道风控门 ══════════════════
   {
+    // ── ① 不带保护 ⇒ 桌宠必须**先问人**（用户裁决 2026-09-23 = 保持 fail-closed）──
+    //
+    // ★ 这一档必须测：闸门在「止盈/止损没有都填」时会短路成 `unverifiable` +
+    //   `pipeline 0/9` —— 所以一句「买一百块钱的比特币」若走到确认，
+    //   **一定**在闸门那里变成"查不了"。桌宠不允许构造这种注定失败的待确认。
+    const protReqBefore = countKind('VOICE_PROTECTION_REQUIRED')
+    const submitsBeforeAsk = countKind('ORDER_SUBMIT')
+    const noProt = await handleUtterance('买一百块钱的比特币')
+    if (noProt.pending) {
+      fail('S3 同一道门', '不带保护的单竟然进了待确认 —— 它一定会在闸门那里变成"查不了"')
+    }
+    if (!noProt.reply.includes('止盈和止损都还没说')) {
+      fail('S3 同一道门', `没问保护价，回话是：${noProt.reply}`)
+    }
+    assertEq('S3 同一道门', countKind('ORDER_SUBMIT'), submitsBeforeAsk, '还没确认就出了一张单')
+
+    // 只给止损也不行（闸门要两个都有），而且必须**说清缺的是哪一个**
+    const halfProt = await handleUtterance('买一百块钱的比特币，止损 1%')
+    if (halfProt.pending) fail('S3 同一道门', '只给止损也进了待确认 —— 闸门要止盈和止损都有')
+    if (!halfProt.reply.includes('还缺止盈')) fail('S3 同一道门', `没说清缺哪一个：${halfProt.reply}`)
+
+    // ★ 留痕：问了两句 ⇒ 账本里必须有两条，否则事后分不清「问了」与「根本没问」（判据 C4）
+    assertEq('S3 同一道门', countKind('VOICE_PROTECTION_REQUIRED'), protReqBefore + 2, '问保护价没留下痕迹')
+
+    // ── ② 带保护的两条路必须命中**同一道**下游门 ─────────────────────────
     // 直接路径（相当于界面按钮）
     const directQty = 800 / MARK
     const direct = processOrderIntent({ clientOrderId: 'direct-gate', symbol: 'BTCUSDT', side: 'buy', type: 'market', qty: directQty })
     if (direct.ok) fail('S3 同一道门', '直接路径的 800U 单竟然通过了逐笔上限 —— 前提条件不成立')
     const directReason = direct.reason ?? ''
 
-    // 语音路径：说 800 块钱 → 确认 → 必须得到**同一个** reason
-    const ask = await handleUtterance('买八百块钱的比特币')
+    // 语音路径：说 800 块钱（**带保护**）→ 确认 → 必须得到**同一个** reason
+    //   ★ 「带保护」是这次的关键：不带保护会在闸门**输入**那一步就被拦，
+    //     于是"两道门是不是同一条"压根没被检验到（判据 B2：断的是"起作用了"还是"出现过"）。
+    const ask = await handleUtterance('买八百块钱的比特币 止盈 5% 止损 1%')
     if (!ask.pending) fail('S3 同一道门', `语音下单未进入待确认：${JSON.stringify(ask.reply)}`)
     const conf = await handleUtterance('确认 800')
     if (!conf.executed) fail('S3 同一道门', `确认后没有执行结果：${JSON.stringify(conf.reply)}`)
@@ -291,7 +379,7 @@ async function main(): Promise<void> {
     assertEq('S3 同一道门', conf.executed.reason, directReason, '语音路径与直接路径的拒绝理由必须逐字一致')
 
     // 反向：额度以内必须真的能成，否则"过门"可能只是因为整条路是死的
-    const okAsk = await handleUtterance('买一百块钱的比特币')
+    const okAsk = await handleUtterance('买一百块钱的比特币 止盈 5% 止损 1%')
     if (!okAsk.pending) fail('S3 同一道门', '额度内订单未进入待确认')
     const okConf = await handleUtterance('确认 100')
     if (!okConf.executed?.ok) fail('S3 同一道门', `额度内语音单应成交，实际：${JSON.stringify(okConf.executed)}`)
@@ -313,12 +401,114 @@ async function main(): Promise<void> {
     )
   }
 
+  // ══════════════════ S3b 裸单通道：只有显式放弃才走 ══════════════════
+  //
+  // ★ 这一块守的是**用户裁决（2026-09-23）**的落地：⑦ 裸单通道要开。
+  //   它与 S3 是一对：
+  //     S3  —— 没提到保护 ⇒ **问人**（不许替用户编一个保护价）；
+  //     S3b —— 明确说不要 ⇒ **按裸单下**，且豁免必须真的进到闸门输入里。
+  //   两条都要有：只有 S3 时功能是"下不出单"，只有 S3b 时"忘了说"会被当成"不要"。
+  {
+    const protReqBefore = countKind('VOICE_PROTECTION_REQUIRED')
+    const submitsBefore = countKind('ORDER_SUBMIT')
+
+    // ── ① 一句「不带保护」就不该再问一遍（问了 = 让用户重说他刚说过的话）──
+    const naked = await handleUtterance('买一百块钱的比特币，不带保护')
+    if (!naked.pending) {
+      fail('S3b 裸单通道', `明确说了不带保护却没过确认：${JSON.stringify(naked.reply)}`)
+    }
+    if (!naked.reply.includes('不挂') && !naked.reply.includes('裸单')) {
+      fail('S3b 裸单通道', `确认回话没有念回"不挂保护"，用户没法在签字前发现理解错了：${naked.reply}`)
+    }
+    assertEq(
+      'S3b 裸单通道',
+      countKind('VOICE_PROTECTION_REQUIRED'),
+      protReqBefore,
+      '已经明确说了不要保护，却又问了一遍',
+    )
+    assertEq('S3b 裸单通道', countKind('ORDER_SUBMIT'), submitsBefore, '还没确认就出了一张单')
+
+    // ── ② 确认之后必须真的成交（额度以内），且**豁免真的进了闸门输入** ────
+    const conf = await handleUtterance('确认 100')
+    if (!conf.executed?.ok) {
+      fail('S3b 裸单通道', `额度内的现货裸单应成交，实际：${JSON.stringify(conf.executed)}`)
+    }
+    // ★★ 这一条是整个 S3b 的核心，也是本仓库付过代价的那条：
+    //   「解析对了 / 念回了 / 审计记了」**≠「挂上了」** —— 保护单那次就是
+    //   解析、念回、留痕全对，唯独没进 `OrderIntentInput`。
+    //   所以这里必须去**闸门自己的留痕**里看那个字段，而不是看语音层的变量。
+    const gateEvents = getEvents(0).filter((e) => e.kind === 'ORDER_GATE')
+    const nakedGate = gateEvents.filter((e) => e.payload.protectionWaived === true)
+    if (nakedGate.length === 0) {
+      fail(
+        'S3b 裸单通道',
+        `闸门留痕里没有一条 protectionWaived=true —— 豁免没有真的进到闸门输入（这正是"保护单"那次的形态）`,
+      )
+    }
+    const last = nakedGate[nakedGate.length - 1].payload
+    if (last.verdict !== 'pass') fail('S3b 裸单通道', `裸单的裁决应为 pass，实际 ${String(last.verdict)}`)
+    const notChecked = Array.isArray(last.notChecked) ? (last.notChecked as unknown[]) : []
+    if (!notChecked.includes('naked.reward_risk')) {
+      fail('S3b 裸单通道', `闸门必须如实报出"哪道门没查"，实际 notChecked=${JSON.stringify(notChecked)}`)
+    }
+    // 与 S3 的配对：豁免只在**显式**那一次出现，另一笔正常单不许被顺带标成裸单
+    if (nakedGate.length !== 1) {
+      fail('S3b 裸单通道', `只有一笔显式裸单，却留了 ${nakedGate.length} 条豁免痕迹 —— 豁免被别处误触发了`)
+    }
+
+    // ── ③ 问过之后再回一句「不要」，也必须是**那一笔单**的豁免 ────────────
+    //
+    // ★ 没有这一段，"桌宠能不能被回答"就完全没被测：用户面对那句提问时
+    //   最自然的回答就是一句「不要」，而它必须被理解成对**上一个问题**的回答，
+    //   不是一笔只有两个字的订单。
+    const asked = await handleUtterance('买一百块钱的比特币')
+    if (asked.pending) fail('S3b 裸单通道', '不带保护的单进了待确认（它一定会在闸门那里变成"查不了"）')
+    if (!asked.reply.includes('不带保护')) {
+      fail('S3b 裸单通道', `提问里必须给出"不带保护"这条路，否则用户无法把它说出口：${asked.reply}`)
+    }
+    const answer = await handleUtterance('不要')
+    if (!answer.pending) {
+      fail('S3b 裸单通道', `回了「不要」之后没进入待确认：${JSON.stringify(answer.reply)}`)
+    }
+    if (!answer.reply.includes('不挂') && !answer.reply.includes('裸单')) {
+      fail('S3b 裸单通道', `回答「不要」之后的确认回话没有念回裸单语义：${answer.reply}`)
+    }
+    const answered = getEvents(0).filter((e) => e.kind === 'VOICE_PROTECTION_ANSWERED')
+    if (answered.length !== 1) {
+      fail('S3b 裸单通道', `「回答过一个问题」必须留痕且只有一条，实际 ${answered.length} 条`)
+    }
+    const conf2 = await handleUtterance('确认 100')
+    if (!conf2.executed?.ok) {
+      fail('S3b 裸单通道', `回答「不要」之后的裸单应成交，实际：${JSON.stringify(conf2.executed)}`)
+    }
+    const waivedEvents = getEvents(0).filter((e) => e.kind === 'VOICE_PROTECTION_WAIVED')
+    // ★ 到这一步一共下了**两笔**裸单（① 显式一句、③ 回答一句），每笔一条 ⇒ 2 条。
+    //   写成"恰好 2"而不是">= 1"：多出来的那条意味着豁免在**别的**单子上也生效了，
+    //   而那正是"静默降级成裸单"这件事的形态。
+    if (waivedEvents.length !== 2) {
+      fail('S3b 裸单通道', `豁免生效必须每笔裸单留一条且一共 2 条，实际 ${waivedEvents.length} 条`)
+    }
+
+    // ── ④ 矛盾说法必须**拒**而不是挑一个（挑错的方向是把要保护的单裸下）──
+    const contra = await handleUtterance('买一百块钱的比特币，止盈 5% 不要保护')
+    if (contra.pending) fail('S3b 裸单通道', '同句既有止盈数字又说不要保护时，不许自己挑一个')
+    if (!contra.reply.includes('矛盾') && !JSON.stringify(contra).includes('CONTRADICTS')) {
+      fail('S3b 裸单通道', `矛盾输入必须说清是矛盾，实际：${contra.reply}`)
+    }
+
+    pass(
+      'S3b 裸单通道',
+      `显式"不带保护"与回答"不要"两条路都进了待确认并成交；闸门留痕 ${nakedGate.length} 条豁免、` +
+        `如实报出未查的 ${notChecked.length} 道门；矛盾说法被拒`,
+    )
+  }
+
   // ══════════════════ S4 两段式确认三个方向 ══════════════════
   {
     const submitsBefore = countKind('ORDER_SUBMIT')
 
     // 4a 只提需求不确认 → 不得下单
-    const ask = await handleUtterance('买三百块钱的比特币')
+    const ask = await handleUtterance('买三百块钱的比特币 止盈 5% 止损 1%')
     if (!ask.pending) fail('S4 两段式确认', `未生成待确认凭据：${JSON.stringify(ask.reply)}`)
     assertEq('S4 两段式确认', countKind('ORDER_SUBMIT'), submitsBefore, '仅提出需求就产生了 ORDER_SUBMIT')
 
@@ -347,7 +537,7 @@ async function main(): Promise<void> {
 
     // 4e 负向对照：小额（≤50U）不需要复述，光说「确认」就该放行。
     //     没有这一条，4b 的"必须拒"就无法排除"所有确认都被拒"这种假实现。
-    const small = await handleUtterance('买二十块钱的比特币')
+    const small = await handleUtterance('买二十块钱的比特币 止盈 5% 止损 1%')
     if (!small.pending) fail('S4 两段式确认', '小额单未生成待确认凭据')
     if (small.pending.expectedNotional > 50) fail('S4 两段式确认', `20U 的待确认名义额算成了 ${small.pending.expectedNotional}`)
     const smallConf = await handleUtterance('确认')
@@ -399,7 +589,7 @@ async function main(): Promise<void> {
     // 5c 端到端：确认执行过程中被插话 → 答复作废；但**已确认的动作不会被撤回**。
     //     这是一条刻意保留的不对称，必须被显式断言，否则将来有人"顺手"改成
     //     "打断即撤单"时，没有任何测试会拦。
-    await handleUtterance('买三十块钱的比特币')
+    await handleUtterance('买三十块钱的比特币 止盈 5% 止损 1%')
     const inFlight = handleUtterance('确认')
     interruptVoice('USER_BARGE_IN')
     const result = await inFlight
@@ -1037,6 +1227,680 @@ async function main(): Promise<void> {
         `默认 ${DEFAULT_VOICE_ID} 走云端 · engineOf 与目录逐条一致 · 本机音色不计入云端失败 · ` +
         `5 类失败原因各有独立文案且都说明退回本机 · 报警只走"上次成功过"的路 · ` +
         `口型时间轴单调且覆盖全部字数 · 缺字段的配置收口后不抛`,
+    )
+  }
+
+  // ══════════════════ S14 系统实况（三态）与能力注册表 ══════════════════
+  //
+  // 这一场景来自一次真实的使用反馈：用户问「Agent 舰队里哪个策略盈利最高」，
+  // 管家回了一句「这句我没听懂」—— 它对自己所在的系统一无所知。
+  //
+  // 修好之后真正要防的不是"答不出来"，而是**答出一个看起来很对的数**：
+  // 界面上 Agent 舰队那一页的收益数字是演示值（页面自己标着「非真实 PnL」），
+  // 一旦被念出来，用户会真的据此决定投钱。
+  // 所以这一场景的核心断言是第 ⑦ 条：**缺数据必须被说出来**。
+  {
+    const name = 'S14 系统实况与工具注册表'
+
+    // ── ① 意图：8 条新口令逐条命中，其中 2 条是"不许被抢走"的反例 ──
+    const cases: { text: string; intent: string }[] = [
+      { text: '系统现在什么情况', intent: 'ask_system' },
+      { text: 'Agent 舰队里哪个策略盈利最高', intent: 'ask_fleet' },
+      { text: '进化实验室能干什么', intent: 'ask_lab' },
+      { text: '进化一下你自己', intent: 'self_upgrade' },
+      { text: '升级一下你自己', intent: 'self_upgrade' },
+      { text: '记住：不要在流动性差的时段追加仓位', intent: 'record_lesson' },
+      // 反例 1：「研发一个策略去达成目标」是执行诉求，不是"看看流水线"。
+      //   它必须落 self_upgrade（真的去跑提案），而不是 ask_fleet（只报现状）——
+      //   这是「任务不许被降级成一次查询」，与 S1b 里「任务不许被换成一个报价」同源。
+      { text: '帮我研发一个策略去达成目标', intent: 'self_upgrade' },
+      // 反例 2：真正的问行情不许被这批新意图吃掉。
+      { text: '比特币现在多少钱', intent: 'query_market' },
+    ]
+    for (const c of cases) {
+      const got = parseIntent(c.text, CTX).intent
+      if (got !== c.intent) fail(name, `「${c.text}」期望 ${c.intent}，实际 ${got}`)
+    }
+
+    // ── ② 三态映射必须**双向**成立 ──
+    // 只断言当前环境下的那一个值是不够的：一个恒返回 'unavailable' 的实现
+    // 在空流水线的机器上照样全绿。喂两个输入，两个方向都钉住。
+    assertEq(name, standingsSourceOf(0), 'unavailable', '空流水线时必须承认"没有数据"，而不是报一个空排行当作答案')
+    assertEq(name, standingsSourceOf(3), 'live', '有记录时必须是 live —— 否则"三态"退化成一个常量')
+
+    const f = fleetStandings()
+    assertEq(name, f.source, standingsSourceOf(f.total), '返回的 source 必须与记录数一致')
+    // 排行口径必须写在数据里。"第一名"是谁取决于口径，口径不写就是靠读者各自理解。
+    assertEq(name, f.rankedBy, 'stage_then_fitness', '排行口径必须显式给出 —— 用户问的是"最赚钱"，我们给的是"走得最远"')
+    // 每条记录都必须自报"我没有盈亏字段"。`false` 是一个可断言的事实，
+    // 比"查不到"更能表达"系统确实不记这个"。
+    if (f.rows.some((r) => r.hasPnl !== false)) {
+      fail(name, '流水线的记录里出现了盈亏字段 —— 数据模型变了，"没有分策略盈亏"这句话要重新核')
+    }
+
+    // ── ③ 排行必须按前进方向排，且 rejected 永远垫底 ──
+    for (let i = 1; i < f.rows.length; i += 1) {
+      if (f.rows[i - 1].stageRank < f.rows[i].stageRank) {
+        fail(name, `排行没按阶段前进方向排：${f.rows[i - 1].id}(${f.rows[i - 1].stage}) 在 ${f.rows[i].id}(${f.rows[i].stage}) 之前`)
+      }
+    }
+    if (PROMOTION_STAGE_RANK.rejected !== 0) fail(name, 'rejected 的排序序号必须恒为 0（它不是一个可比较远近的位置）')
+
+    // ── ④ 阶段中文名必须覆盖**全部**阶段 ──
+    // 这条直接对应一个真实缺陷：改造前有两份 STAGE_LABEL，两份都缺
+    // testnet_verifying / testnet_verified，配合 `?? stage` 兜底，
+    // 走到测试网阶段的策略在界面上显示英文原值，且没有任何东西会报红。
+    const STAGES = Object.keys(PROMOTION_STAGE_RANK) as (keyof typeof PROMOTION_STAGE_RANK)[]
+    const labelMissing = STAGES.filter((s) => !PROMOTION_STAGE_LABEL[s])
+    if (labelMissing.length > 0) fail(name, `阶段缺中文名，界面上会显示英文原值：${labelMissing.join(', ')}`)
+    assertEq(
+      name,
+      Object.keys(PROMOTION_STAGE_LABEL).length,
+      STAGES.length,
+      '中文名表键数必须等于阶段数 —— 多一个键意味着有个名字对应不到任何状态',
+    )
+
+    // ── ⑤ 「盈利最高」的正解就是 unavailable，且理由必须写清缺什么 ──
+    const verdict = fleetPnlVerdict()
+    if (verdict.available !== false) fail(name, '"哪个策略盈利最高"竟然变成可回答的了 —— 请先拿出真实的分策略盈亏来源')
+    // ★ 这一条要**两侧夹逼**，只查一个方向会漏。
+    //   第一版只写了 `/没有/.test(reason)`，破坏验证的 M4 当场证明了它抓不住：
+    //   那句话里别处本来就有一个"没有"（"测试网统计同样没有金额"），
+    //   于是把"系统里没有按策略的盈亏数据"改成"系统里有按策略的盈亏数据"照样全绿。
+    //   ⇒ 一侧要求它点到"缺什么"，另一侧要求它**不出现任何"其实有"的说法**。
+    if (!/按策略的盈亏/.test(verdict.reason)) {
+      fail(name, `拒绝理由没点出缺的是什么（分策略盈亏）：${verdict.reason}`)
+    }
+    // ★ 极性检查必须带**否定环视**。
+    //   第一版写的是 `/有按策略的盈亏|.../`，而它会命中
+    //   「系统里没[有按策略的盈亏]数据」—— 于是这条断言对**正确输入**也报错。
+    //   一个对正确输入报错的检查比不报错的更费人：它会训练你忽略它的红。
+    //   `(?<![没不])` 要求那个"有"不是被否定的。
+    if (/(?<![没不])有按策略的盈亏|(?<![不])能按策略排|(?<![不])可以按策略排/.test(verdict.reason)) {
+      fail(name, `拒绝理由里出现了"其实能按策略排名"的说法，与 unavailable 自相矛盾：${verdict.reason}`)
+    }
+
+    // ── ⑥ 文案卫生：三份回话都要能念 ──
+    const speeches: Record<string, string> = { 系统实况: speakSituation(), 舰队: speakFleet(), 实验室: speakLab() }
+    for (const label of Object.keys(speeches)) {
+      const text = speeches[label]
+      if (/\[object Object\]|undefined|NaN|\bnull\b/.test(text)) {
+        fail(name, `${label}文案含占位符垃圾，念出来就是事故：${text.slice(0, 120)}`)
+      }
+      if (/\*\*|^#|\|.*\|/.test(text)) fail(name, `${label}文案含 Markdown 记号，会被念成"星号"：${text.slice(0, 120)}`)
+      if (text.length < 20) fail(name, `${label}文案过短（${text.length} 字）—— 像是一条没接上数据的兜底句`)
+    }
+
+    // ── ⑦ 核心断言：**缺数据必须被说出来**（逐份文案对它自己欠的披露负责）──
+    //
+    // 整场测试里最该存在的就是这一条。前面所有断言都只保证"算得对"，
+    // 只有它保证"没骗人"：一个把演示数字当真实收益念出来的实现，
+    // 前面六条全都能过。
+    //
+    // ★ 这一条的第一版是错的，且错得看不出来：它只查了「舰队」这一份文案。
+    //   于是把 speakSituation 里那句"系统里没有按策略的盈亏数据"整句删掉，
+    //   测试照样全绿 —— 第十一轮变异 M7 实测逃逸。
+    //   根因是"随便哪一份说了就算说了"（判据 3：负向断言被邻居顶替）。
+    //   ⇒ 改成一张**逐份文案的披露欠条**：谁欠哪句，就由谁报红。
+    const owed: { label: string; need: RegExp; why: string }[] = [
+      { label: '系统实况', need: /没有按策略的盈亏数据/, why: '报了一堆数之后不说这句，用户会以为系统连分策略收益都有' },
+      { label: '舰队', need: /没有按策略的盈亏数据/, why: '沉默会被用户读成"系统有这项"' },
+      { label: '舰队', need: /非真实|演示/, why: '不说就是默许他把页面上那几个演示数字当成真实收益' },
+      { label: '实验室', need: /谱系/, why: '不说就是默许他把页面画的那棵树当成系统里的数据' },
+    ]
+    for (const { label, need, why } of owed) {
+      if (!need.test(speeches[label])) {
+        fail(name, `${label}文案欠了一句必须说的话（${need}）—— ${why}：${speeches[label].slice(0, 120)}`)
+      }
+    }
+    // 反向：三份文案**都不许**给出一个"第一名"。
+    // 只做正向检查的话，一个"既说了没有数据、又顺手报个第一名"的实现能全绿。
+    const canary = '盈利最高的是 AG-ALPHA，收益 +12480 美元。'
+    if (!/盈利最高的是/.test(canary)) fail(name, '检查器自身失灵：给定一句假装能排名盈利的话，它竟然没识别出来')
+    for (const label of Object.keys(speeches)) {
+      if (/盈利最高的是/.test(speeches[label])) {
+        fail(name, `${label}文案里出现了"盈利最高的是" —— 系统没有分策略盈亏数据，这句话是编的`)
+      }
+    }
+    // 实验室回话必须说明"谱系树是演示"，否则用户会把页面画的东西当成系统有的。
+    if (labOverview().lineage.source !== 'demo') fail(name, `谱系树应当标为 demo，实际 ${labOverview().lineage.source}`)
+    // 实验室要真的告诉用户"能怎么用"，否则"知道有实验室"仍然等于没用。
+    if (labOverview().capabilities.length < 3) fail(name, '实验室能力清单不足 3 条 —— 用户仍然不知道拿它做什么')
+
+    // ── ⑧ 自我进化：边界必须被说出来 ──
+    // "不能自己改代码上线"如果不说，用户会默认它能 —— 那是一个假承诺，
+    // 而假承诺的代价是他把一件需要他批的事当成已经自动完成了。
+    const intro = await handleUtterance('介绍一下你自己')
+    if (!/改代码/.test(intro.reply)) fail(name, '自我介绍没说清"改代码要你批"这条边界')
+    if (!/提案/.test(intro.reply)) fail(name, '自我介绍没说清自我进化的落点是提案引擎')
+
+    // ── ⑨ 未确认不得执行（负向）──
+    const runsBefore = countKind('VOICE_TOOL_RUN') + countKind('VOICE_TOOL_RUN_STARTED')
+    const askUpgrade = await handleUtterance('进化一下你自己')
+    assertEq(name, askUpgrade.intent, 'self_upgrade')
+    if (!askUpgrade.pending) fail(name, '一个会改变系统将来行为的动作竟然没生成待确认凭据')
+    assertEq(name, countKind('VOICE_TOOL_RUN') + countKind('VOICE_TOOL_RUN_STARTED'), runsBefore, '仅提出诉求就执行了工具')
+    await handleUtterance('取消')
+
+    // ── ⑩ 确认后执行路径真的被走到，且**绕不过宪法红线**（正向 + 不污染）──
+    //
+    // 用一条注定被拒的心法来测，一举三得：
+    //   ① 证明"确认之后执行路径确实被走到了"（否则第 ⑨ 条会退化成"一个从不执行的实现也能过"）；
+    //   ② 证明语音登记心法吃的是**同一道宪法 lint**，语音不是绕过红线的新通道
+    //      （与 S3「语音下单必须过同一道风控门」同源）；
+    //   ③ 不污染心法库 —— 这条测试跑一百次，心法库还是那么多条。
+    //
+    // 选「突破之后一定涨不要犹豫」的理由：它命中「确定性幻觉」红线，
+    // 于是**与账本里有几笔成交无关**，结果恒为拒绝。改用"样本量不足"来构造拒绝
+    // 是不行的 —— 那取决于前面几个场景成交了几笔，会随测试顺序漂移。
+    const lessonsBefore = loadLessons().length
+    const askLesson = await handleUtterance('记住：突破之后一定涨不要犹豫')
+    assertEq(name, askLesson.intent, 'record_lesson')
+    if (!askLesson.pending) fail(name, '登记心法未生成待确认凭据')
+    const conf = await handleUtterance('确认')
+    if (conf.executed?.ok !== false) fail(name, `命中宪法红线的心法竟然入册了：${JSON.stringify(conf.executed)}`)
+    if (!/红线|样本|拒|不能/.test(conf.reply)) fail(name, `拒绝理由不是人话或没说出原因：${conf.reply}`)
+    assertEq(name, countKind('VOICE_TOOL_RUN'), 1, '确认之后没有留下 VOICE_TOOL_RUN —— 执行路径没被走到（第 ⑨ 条因此是假绿）')
+    assertEq(name, loadLessons().length, lessonsBefore, '被拒的心法污染了心法库')
+
+    // ── ⑪ 类别判不出来时必须拒绝并列出合法值，不许猜 ──
+    // 猜错类别的代价不是"这条心法没用"，而是它会以错误的类别被回灌进
+    // 每一次提案的上下文 —— 那是长期污染面。
+    if (inferLessonCategory('今天天气不错').category !== null) fail(name, '判不出类别竟然给了答案')
+    const noCat = await handleUtterance('记住：今天天气不错适合散步')
+    if (noCat.pending) fail(name, '类别判不出来却还是让用户去确认 —— 让用户确认一件注定失败的事')
+    if (!/类别/.test(noCat.reply)) fail(name, `拒绝时没告诉用户合法类别：${noCat.reply}`)
+
+    // ── ⑫ 工具注册表自检：0 问题，**且证明它会报红** ──
+    const problems = auditToolRegistry()
+    if (problems.length > 0) {
+      fail(name, `注册表有 ${problems.length} 个问题：${problems.map((p) => `${p.toolId}:${p.problem}`).join(' | ')}`)
+    }
+    if (VOICE_TOOLS.length < 7) fail(name, `工具数只有 ${VOICE_TOOLS.length} 个，能力面被裁了`)
+
+    // 注入式负向测试：喂六个坏工具，**每类检查各有一个"只有它会命中"的输入**。
+    // 没有这一段，将来有人把 reuses 检查删掉，门禁照样全绿 ——
+    // 而那正是"语音专用实现"重新长出来的那一天。
+    //
+    // ★ 这一段第一版只有四个坏工具，于是第五类检查（act 的意图必须在 DANGEROUS 里）
+    //   **从来没有被单独喂过**：`act-no-intent` 同时缺 intent，命中的是它的**前一个分支**，
+    //   所以把 DANGEROUS 那整块 if 删掉，测试照样全绿 —— 第十一轮变异 M5 实测逃逸。
+    //   ⇒ 修法是两件事一起做：
+    //     ① 每个坏工具只犯**一个**错（`act-no-intent` 补上 label，另开一个 `no-label`）；
+    //     ② 断言把问题**归属到具体工具**（`p.toolId === only`），
+    //        而不是"某条问题里出现了某个词" —— 后者正是被邻居顶替的入口。
+    const bad: VoiceTool[] = [
+      { id: 'dup', label: 'a', kind: 'read', cost: 'instant', reuses: 'x', run: () => ({ ok: true, speech: 'a', steps: [] }) },
+      { id: 'dup', label: 'b', kind: 'read', cost: 'instant', reuses: 'x', run: () => ({ ok: true, speech: 'b', steps: [] }) },
+      { id: 'no-reuses', label: 'c', kind: 'read', cost: 'instant', reuses: '', run: () => ({ ok: true, speech: 'c', steps: [] }) },
+      { id: 'no-label', label: '', kind: 'read', cost: 'instant', reuses: 'x', run: () => ({ ok: true, speech: 'd', steps: [] }) },
+      { id: 'act-no-intent', label: 'e', kind: 'act', cost: 'slow', reuses: 'x', run: () => ({ ok: true, speech: 'f', steps: [] }) },
+      { id: 'act-nondanger', label: 'g', kind: 'act', cost: 'slow', reuses: 'x', intent: 'query_market', run: () => ({ ok: true, speech: 'h', steps: [] }) },
+    ]
+    // 这一句保护上面的注入用例本身：若哪天 `query_market` 被移进 DANGEROUS，
+    // `act-nondanger` 就不再是"坏工具"，第五类检查又会变成**不可能失败**的检查。
+    if (isDangerous('query_market')) fail(name, '注入用例自身失效：query_market 现在是危险意图，act-nondanger 不再是坏工具')
+    const injected = auditToolRegistry(bad)
+    const needList: { only: string; need: string }[] = [
+      { only: 'dup', need: 'id 重复' },
+      { only: 'no-reuses', need: 'reuses' },
+      { only: 'no-label', need: '缺 label' },
+      { only: 'act-no-intent', need: '未声明 intent' },
+      { only: 'act-nondanger', need: 'DANGEROUS' },
+    ]
+    for (const { only, need } of needList) {
+      if (!injected.some((p) => p.toolId === only && p.problem.includes(need))) {
+        fail(name, `注入坏工具 "${only}" 后，它该命中的 "${need}" 没被报出来 —— 这条检查形同不存在`)
+      }
+    }
+    // 反向：坏工具喂进去必须只报问题、不能报出"没问题"；同时合法注册表不许被误报。
+    if (injected.length < needList.length) {
+      fail(name, `六个坏工具只报出 ${injected.length} 个问题 —— 有检查在漏`)
+    }
+
+    // ── ⑬ act 工具必须落在 DANGEROUS 名单里 ──
+    // 这里查的是**真实注册表**，与 ⑫ 的注入用例互为对照：
+    // 只有注入用例会红 ⇒ 真实注册表可能早就坏了；只有真实注册表会红 ⇒ 注入用例没覆盖到。
+    const actMissing = VOICE_TOOLS.filter((t) => t.kind === 'act' && !t.intent)
+    if (actMissing.length > 0) fail(name, `有 act 工具没声明 intent：${actMissing.map((t) => t.id).join(', ')}`)
+    const actNotDangerous = VOICE_TOOLS.filter((t) => t.kind === 'act' && t.intent && !isDangerous(t.intent))
+    if (actNotDangerous.length > 0) {
+      fail(name, `真实注册表里有 act 工具的意图不在 DANGEROUS 名单：${actNotDangerous.map((t) => `${t.id}:${t.intent}`).join(', ')}`)
+    }
+
+    // ── ⑭ 系统实况必须真的读到东西（不是一份全 null 的骨架）──
+    const sit = situation()
+    const liveCount = Object.values(sit).filter((x) => (x as { source: string }).source === 'live').length
+    if (liveCount < 8) fail(name, `系统实况只有 ${liveCount} 项是 live —— 管家会以为自己对系统一无所知`)
+
+    pass(
+      name,
+      `${cases.length} 条新口令逐条命中（含 2 条反例）· 三态双向可证 · 排行口径显式且 rejected 垫底 · ` +
+        `${STAGES.length} 个阶段中文名零缺口 · 「盈利最高」正解为 unavailable 且理由写清 · ` +
+        `三份文案各自欠的披露逐份对账（"没有分策略盈亏" / "演示值" / "谱系"），且都不许报出第一名 · 自我介绍交代改代码边界 · ` +
+        `自我进化未确认不执行、确认后过宪法红线且不污染心法库 · ` +
+        `注册表 ${VOICE_TOOLS.length} 个工具 0 问题且注入 ${needList.length} 个坏工具逐条归属报红 · 系统实况 ${liveCount} 项真实来源`,
+    )
+  }
+
+  // ══════════════ S16 模型失败的三种性质必须被分开 ══════════════
+  //
+  // ★ 实测（2026-09-19）：三个免费视觉候选全败，回话把用户引向"模型名字烂掉了"，
+  //   而探针原文是 `HTTP 429 free-models-per-day`（额度打满）。
+  //   两种事因长得一样，下一步却相反：一个去换名单，一个去等额度。
+  //   所以三种性质各喂**一个只有它会命中的输入**（判据 3），
+  //   并各自配一句"别的分支的话不许出现在这里"（判据 4）。
+  {
+    const name = 'S16 模型失败三态'
+    const quota = [{ model: 'a:free', reason: 'EMPTY_RESPONSE: HTTP 429 Rate limit exceeded: free-models-per-day' }]
+    const paid = [
+      { model: 'p-a', reason: 'PAID_NOT_ALLOWED：未开启 EV_LLM_ALLOW_PAID' },
+      { model: 'p-b', reason: 'PROBE_NEVER_PAID：探测层不占用付费额度' },
+    ]
+    const rotted = [{ model: 'a:free', reason: 'EMPTY_RESPONSE: HTTP 404 model not found' }]
+
+    assertEq('S16 ① 429 判成额度', modelFailureKind(quota), 'quota')
+    assertEq('S16 ② 付费候选全被跳过判成付费受阻', modelFailureKind(paid), 'paid-blocked')
+    assertEq('S16 ③ 404 判成名字烂了', modelFailureKind(rotted), 'no-candidate-worked')
+
+    const qs = modelFailureSpeech('quota', quota)
+    // ★ 负向断言选的是**各自的"下一步"动作词**，不是随便一个语义词。
+    //   第一版写的是 `!/名字烂了/`，而额度那份文案里有一句
+    //   "这不是模型名字烂了" —— **它以否定形式包含了那个词**，
+    //   于是断言对正确输出报错。选词必须选"别的分支才会出现的动作词"：
+    //   额度 ⇒ 免费额度 / 付费 ⇒ 开关名 / 名字烂了 ⇒ 探针命令。
+    if (!/免费额度/.test(qs) || /llm:probe/.test(qs)) {
+      fail(name, `额度用完的说明必须指向额度、且不许给出探针那一步（用户会去换名单）：${qs.slice(0, 80)}`)
+    }
+    const ps = modelFailureSpeech('paid-blocked', paid)
+    if (!/EV_LLM_ALLOW_PAID/.test(ps) || /llm:probe/.test(ps) || /免费额度/.test(ps)) {
+      fail(name, `付费受阻的说明必须指向付费开关，且不许说成"额度用完"或"名字烂了"：${ps.slice(0, 80)}`)
+    }
+    const rs = modelFailureSpeech('no-candidate-worked', rotted)
+    if (!/llm:probe/.test(rs) || /免费额度/.test(rs)) {
+      fail(name, `名字烂了的说明必须指向探针，且不许说成"额度用完"：${rs.slice(0, 80)}`)
+    }
+
+    pass(name, '三态各喂一个专属输入 · 三份说明各含专属下一步且互不顶替（免费额度 / 付费开关 / 探针）')
+  }
+
+  // ── S15：界面按钮通道的**两档顺序**与"唯一一份实现" ──────────────────────
+  //
+  // ★ 为什么这一条必须是**源码级**而不是行为级：
+  //   `resolveExplicitPress` 单独测得出"它认识哪一句"（见 ui-actions-smoke 的 U24 组），
+  //   但**"它排在只读问答之前"这件事只有在源码顺序里**。
+  //   行为上无法证伪：不管顺序如何，`ask_agents` 都会答得上话 ——
+  //   而用户要的是按按钮。所以这里读源码、比下标。
+  //
+  // ★ 它在什么条件下会变红：
+  //   ① `resolveExplicitPress` 那一行被删掉或移到只读问答之后；
+  //   ② 有人给"按一颗按钮"再写一份实现（第二个 `prepareUiClick(` 调用点）；
+  //   ③ 有人把"主人是舰队计划"那段回话再抄一份。
+  {
+    const name = 'S15 界面按钮通道'
+    const svc = readFileSync(join(process.cwd(), 'server', 'voice', 'service.ts'), 'utf8')
+
+    const at = (needle: string): number => svc.indexOf(needle)
+    const iStrict = at('resolveExplicitPress(text)')
+    if (iStrict < 0) {
+      fail(name, 'service.ts 里没有调用 resolveExplicitPress —— 严格档没接线，"明说按/点"会被只读问答抢走')
+    }
+    // 只读问答的第一条（ask_system）就是"抢单区"的起点。
+    const iReadOnly = at("parsed.intent === 'ask_system'")
+    if (iReadOnly < 0) {
+      fail(name, "找不到只读问答起点（parsed.intent === 'ask_system'）—— 锚点失效，这条断言已经失去意义")
+    }
+    if (iStrict > iReadOnly) {
+      fail(
+        name,
+        `严格档排在只读问答之后（${iStrict} > ${iReadOnly}）—— 「风控中心页跑一次沙盒演练」会再次收到状态汇报而不是被按下`,
+      )
+    }
+    // ③ 危险意图（下单/平仓/急停）不许被按钮通道顶掉。
+    //
+    // ★ 这条**不能靠顺序**保：只读问答本身就排在订单处理之前，
+    //   所以"既在只读前又在订单后"在结构上不可能成立（第一版断言就是这么错的）。
+    //   保它的是一个**紧邻的否定护栏**：`!isDangerous(parsed.intent)`。
+    //   一句「按一下买入」的解析结果就是危险意图，它必须走下单那条路（含风控与确认），
+    //   而不是去按界面上的「买入」（那颗只切方向）。
+    const iGuard = svc.lastIndexOf('!isDangerous(parsed.intent)', iStrict)
+    if (iGuard < 0 || iStrict - iGuard > 800) {
+      fail(
+        name,
+        `严格档前面没有紧邻的 isDangerous 否定护栏（护栏下标 ${iGuard}，严格档下标 ${iStrict}）—— 危险意图会被按钮通道顶掉`,
+      )
+    }
+
+    // ④ 唯一一份实现：`prepareUiClick` 只有"定义 + 一处调用"。
+    const prepCalls = svc.split('prepareUiClick(').length - 1
+    if (prepCalls !== 2) {
+      fail(name, `prepareUiClick 出现 ${prepCalls} 次（应为 2：定义 1 + 调用 1）—— "按一颗按钮"又多了一条实现路径`)
+    }
+    // ⑤ "主人是舰队计划"那段回话也只许有一份。
+    const ownedSpeech = svc.split('这件事的主人是舰队计划').length - 1
+    if (ownedSpeech !== 1) {
+      fail(name, `"主人是舰队计划"那段回话出现 ${ownedSpeech} 次（应为 1）—— 两份文案迟早给出不同的下一步动作`)
+    }
+
+    pass(name, '严格档排在只读问答之前 · 危险意图有否定护栏 · prepareUiClick 唯一调用点 · 归属回话唯一一份')
+  }
+
+  // ══════════════════ S17 走势预测：诉求不许被换成报价 ══════════════════
+  //
+  // ★ 这一组治的是用户实测报上来的原话：「帮我预测比特币未来1小时的走势图」。
+  //   加这条分支之前它的解析结果是 `query_market`（置信度 0.6）—— 被最后那条
+  //   **裸标的兜底**接走，回一句 BTC 现价。用户问的是"未来会到哪、为什么"，
+  //   收到一个当前价格。它报的数字是对的，只是不是他问的那件事 ——
+  //   本仓库记过多次的第三族失败：**答非所问，却听起来像在回答**。
+  //
+  // ★ 断言必须**成对**（正例 + 反例），缺一不可：只钉正例的话，把
+  //   `FORECAST_WORDS` 放宽到含"行情"两个字也能全绿 —— 而那会让每一句
+  //   「比特币多少钱」都变成一次 6 秒的预测（判据 2：对正确的输入报错）。
+  {
+    const name = 'S17 走势预测'
+
+    // ① 用户原话（逐字，不许改）。
+    const user = parseIntent('帮我预测比特币未来1小时的走势图', CTX)
+    assertEq(`${name} 用户原话`, user.intent, 'query_forecast')
+    assertEq(`${name} 听出了标的`, user.forecastSymbol, 'BTCUSDT')
+    assertEq(`${name} 听出了跨度`, user.horizonMinutes, 60)
+
+    // ② 其它说法也要接住。含一条**原来被 `query_status` 抢走**的
+    //    （"接下来"在它的词表里，实测这句拿到的是"我在忙什么"）。
+    for (const t of [
+      '预测一下 BTC 未来一小时走势',
+      '比特币接下来一小时会涨还是会跌',
+      '比特币能涨到多少',
+      '未来4小时 BTC 会怎么走',
+      '帮我预判一下以太坊后市',
+    ]) {
+      const got = parseIntent(t, CTX).intent
+      if (got !== 'query_forecast') fail(name, `「${t}」期望 query_forecast，实际 ${got}`)
+    }
+
+    // ③ ★ 反例一：真问价必须仍然是问价。
+    //   ★ 四条里必须有「现价」这一条：变异验证抓到过 —— 把 `现价` 加进
+    //     `FORECAST_WORDS` 时，原来的四条**一条都没红**（它们分别含
+    //     "现在多少钱 / 报价 / 行情 / 价格"，恰好都不含"现价"）。
+    //     那就是一条没有牙的反例清单：它看着覆盖了四类说法，
+    //     实际上漏掉了最口语的那一类（判据 3：有没有一个输入是"只有它"会命中的）。
+    for (const t of ['比特币现在多少钱', 'BTC 的报价', '行情怎么样', '比特币价格是多少', '比特币现价多少']) {
+      const got = parseIntent(t, CTX).intent
+      if (got !== 'query_market') {
+        fail(name, `「${t}」被预测分支抢走了（实际 ${got}）—— 查行情不该被升级成一次 6 秒的预测`)
+      }
+    }
+    // ④ ★ 反例二：解释性提问交给模型（与 query_market 共用同一份 `looksExplanatory`）。
+    for (const t of ['预测模型的原理是什么', '为什么预测比特币会涨']) {
+      const got = parseIntent(t, CTX).intent
+      if (got === 'query_forecast') fail(name, `「${t}」问的是机制，不该走预测 —— 用户会收到一段行情数字`)
+    }
+    // ⑤ ★ 反例三：没指名标的时**不许**替用户挑一个顶上。
+    //   （默认 BTCUSDT 的后果是把"以太坊的预测"当"比特币的预测"讲出来，
+    //    而那句话在字面上完全说得通。）
+    const noSym = parseIntent('预测一下未来一小时的走势', CTX)
+    assertEq(`${name} 没指名标的`, noSym.intent, 'query_forecast')
+    assertEq(`${name} 且不带标的（交给服务层问一句）`, noSym.forecastSymbol ?? null, null)
+
+    // ⑥ 跨度解析：**只认带单位的数**，裸数字不认。
+    //   猜一个等于替用户填槽位，而槽位猜错的下场是给他一个别的时间跨度的结论。
+    const horizons: [string, number | null][] = [
+      ['未来1小时', 60],
+      ['未来一小时', 60],
+      ['未来两小时', 120],
+      ['未来30分钟', 30],
+      ['未来半小时', 30],
+      ['未来4小时', 240],
+      ['看未来10分钟', 10],
+      ['预测一下 BTC', null],
+      ['预测 4', null],
+    ]
+    for (const [t, want] of horizons) {
+      const got = parseHorizonMinutes(t)
+      if (got !== want) fail(name, `「${t}」期望跨度 ${want}，实际 ${got}`)
+    }
+    // ⑦ 没提时间时，意图层必须回落到预测层的默认档（15m × 4 根 = 1 小时）。
+    assertEq(`${name} 没提时间用默认档`, parseIntent('预测一下比特币', CTX).horizonMinutes, 60)
+
+    // ⑧ 工具层：预测必须是**只读**工具，且 `reuses` 指向预测层。
+    //   ★ 它若是 act，就会走两段式确认 —— 用户问一句"会跌吗"要复述金额，
+    //     那会训练他闭眼确认（本仓库最怕的一种训练）。
+    const tool = VOICE_TOOLS.find((t) => t.id === 'forecast')
+    if (!tool) fail(name, '能力注册表里没有 forecast —— 桌宠这句话会掉进大模型兜底')
+    assertEq(`${name} 预测必须是只读工具`, tool!.kind, 'read')
+    if (!tool!.reuses.includes('forecastService')) {
+      fail(name, `reuses 没指向预测层：「${tool!.reuses}」`)
+    }
+    if (isDangerous('query_forecast')) {
+      fail(name, '预测被判成危险意图 —— 它不下单、不改状态，不该要用户复述金额')
+    }
+
+    // ⑨ 真的跑一次出口，只钉"它有没有把不可信说出来"。
+    //   ★ 刻意**不断言方向/价位**：那是数据相关的，写进 CI 会变成随机地雷
+    //     （本仓库栽过：断言写死"通过 == 20"，注册表长到 21 就变红）。
+    //     语义不变量由 `test:forecast` 的 27 条负责，这里只验**语音层拿到的文案**。
+    const out = (await tool!.run(JSON.stringify({ symbol: 'BTCUSDT', horizonMinutes: 60 }))) as {
+      ok: boolean
+      reason?: string
+      speech: string
+      steps: string[]
+      detail?: { outcome?: string; gate?: string; horizonMinutes?: number; path?: unknown[] }
+    }
+    if (!out.ok) fail(name, `预测出口跑失败：${out.reason ?? '未知'}`)
+    if (/\*\*|⚠️|`/.test(out.speech)) {
+      fail(name, `口播文案里出现了 Markdown/emoji 记号（TTS 会念成"星号星号"）：「${out.speech.slice(0, 90)}」`)
+    }
+    if (!/没有统计优势|无法给出可靠预测/.test(out.speech)) {
+      fail(name, `口播没有把"这个结论能不能信"说出来 —— 用户会把噪声当信号：「${out.speech.slice(0, 140)}」`)
+    }
+    if (out.steps.length === 0) fail(name, '只读工具必须报出过程（用户要知道我查了哪几处）')
+    assertEq(`${name} 跨度写回实际值`, out.detail?.horizonMinutes, 60)
+    if (!['actionable', 'no-edge', 'unverifiable'].includes(out.detail?.outcome ?? '')) {
+      fail(name, `出口的 outcome 不在三态里：${out.detail?.outcome}`)
+    }
+
+    // ⑩ 端到端：走真实入口一次，账本里必须留下两笔（开始算 / 算完）。
+    //   ★ 只留"算完"那一笔的后果：用户投诉"它说在算，然后没下文了"时，
+    //     账本上分不出是没算完还是没播出来。
+    resetVoice()
+    resetOrch(100_000)
+    seedPrice('BTCUSDT', MARK)
+    const beforeStarted = countKind('VOICE_FORECAST_STARTED')
+    const beforeDone = countKind('VOICE_FORECAST')
+    const q = await handleUtterance('帮我预测比特币未来1小时的走势图')
+    assertEq(`${name} 端到端意图`, q.intent, 'query_forecast')
+    assertEq(`${name} 账本记下"开始算"`, countKind('VOICE_FORECAST_STARTED'), beforeStarted + 1)
+    assertEq(`${name} 账本记下"算完了"`, countKind('VOICE_FORECAST'), beforeDone + 1)
+    if (!/没有统计优势|无法给出可靠预测/.test(q.reply)) {
+      fail(name, `端到端回话没有交代可信度：「${q.reply.slice(0, 140)}」`)
+    }
+    // ⑪ 没指名标的时，服务层必须**问一句**，而不是默认一个标的算出来。
+    const ask = await handleUtterance('预测一下未来一小时的走势')
+    assertEq(`${name} 没指名标的不许算`, ask.intent, 'query_forecast')
+    if (!/哪个标的/.test(ask.reply)) {
+      fail(name, `没指名标的时没有反问，而是直接答了：「${ask.reply.slice(0, 120)}」`)
+    }
+    assertEq(
+      `${name} 反问时不许留"开始算"的痕迹`,
+      countKind('VOICE_FORECAST_STARTED'),
+      beforeStarted + 1,
+      '还没定标的就播报"开始算"，用户会以为它知道要算哪个',
+    )
+
+    pass(
+      name,
+      `用户原话逐字命中（BTCUSDT · 60 分钟）· 5 种说法接住 · 4 条真问价 + 2 条解释性提问不被抢 · ` +
+        `9 组跨度解析 · 只读工具且非危险意图 · 出口文案无 Markdown 且交代可信度 · ` +
+        `端到端留痕两笔（开始算 / 算完）· 未指名标的时反问而不臆断`,
+    )
+  }
+
+  // ── T：桌宠对话记录（Task #114）──────────────────────────────────────
+  //
+  // 这一组守的是「聊过的话必须能被找回」。
+  // 它比别的组多一个**前置动作**：把记录根指到临时目录 —— 否则跑一次烟测
+  // 就往用户的真实聊天记录里灌一堆假对话，而那些假对话在界面上和真的
+  // 长得一模一样。
+  {
+    // ★ 用一个**全新的、还不存在的**目录：
+    //   ① 隔离必须早于这一组（理由见 main 开头），所以挂在 main 的临时根下面；
+    //   ② 这一组开头的断言要"从零开始"，而 main 那个根已经被 S 组写过了
+    //      （S11 端到端就有 5 轮真实问答）—— 直接复用的话 T01/T02 都会红，
+    //      而红的原因是"测试自己前一步写了东西"，不是被测代码有问题。
+    const tmp = join(transcriptTmp, 'case-fresh')
+    setTranscriptRoot(tmp)
+    resetTranscriptHealth()
+
+    // ① 目录不存在时，这是「真的没聊过」，不是「读不到」。
+    //    两者在界面上长得一样，却指向相反的动作：去聊一句 vs 去修路径。
+    const empty = readTranscript()
+    assertEq(
+      'T01 没聊过 ≠ 读不到',
+      `${empty.unreadable}|${empty.turns.length}|${empty.badLines}`,
+      'null|0|0',
+      '目录不存在时 unreadable 必须是 null（真的没聊过），而不是一句错误文案',
+    )
+
+    // ② 走**生产入口**说一句。
+    //    ★ 刻意不直接调 recordUserTurn —— 那只能证明"函数存在"，证明不了
+    //      它被接线（判据 10：有函数 ≠ 有人调它）。
+    const r = await handleUtterance('帮助')
+    const page = readTranscript()
+    assertEq('T02 生产入口说一句就落盘', page.turns.length, 1, '走 handleUtterance，不是直接调 record*')
+    assertEq('T03 这一轮是 answered', String(page.turns[0]?.state), 'answered', '')
+    assertEq('T04 用户原话逐字落盘', String(page.turns[0]?.user?.text), '帮助', '')
+    assertEq('T05 桌宠回话逐字落盘', String(page.turns[0]?.assistant?.text), r.reply, '')
+    assertEq(
+      'T06 意图被补记到用户行上',
+      String(page.turns[0]?.user?.intent),
+      'help',
+      'VoiceTurn.intent 在此之前从来没有被赋值过 —— 一个永远 undefined 的字段，配上"面板要显示意图"的期望就是哑失败',
+    )
+
+    // ③ 被打断而作废的答复**也要落盘**，且要带原因。
+    //    ★ 这条守的是一个很自然的"优化"：既然作废了，还记它干嘛？
+    //      去掉之后，用户回看只会看到自己问了一句、下面空着 ——
+    //      于是"它没答"与"它答了但被打断"再也分不开（判据 25）。
+    const t2 = beginTurn('测试打断')
+    const genBefore = currentGeneration()
+    interrupt('SMOKE_T')
+    assertEq('T07 被打断的答复提交失败', commitReply(t2.turnId, '这条不该被念出来', genBefore), false, '')
+    const droppedTurn = readTranscript().turns.find((t) => t.user?.text === '测试打断')
+    assertEq('T08 作废的答复也在记录里', String(droppedTurn?.assistant?.text), '这条不该被念出来', '')
+    assertEq(
+      'T09 且标明是打断作废',
+      String(droppedTurn?.assistant?.dropReason),
+      'generation',
+      '打断与"轮次翻篇"指向相反的下一步动作，合成一个 dropped 就再也分不出来',
+    )
+
+    // ④ 配对键是 sid+turnId，不是 turnId。
+    //    ★ 单按 turnId 配对，会把「上次开机第 1 轮」与「这次开机第 1 轮」
+    //      拼成同一轮 —— 而拼出来的那轮**看着完全正常**：两边的话都像人说的。
+    recordUserTurn({ sid: 'sessA', turnId: 1, text: 'A 说的', at: Date.now() })
+    recordAssistantTurn({ sid: 'sessB', turnId: 1, text: 'B 答的', at: Date.now(), gen: 0, dropped: false })
+    const p2 = readTranscript()
+    const sessA = p2.turns.find((t) => t.sid === 'sessA')
+    const sessB = p2.turns.find((t) => t.sid === 'sessB')
+    assertEq(
+      'T10 跨会话同号不串轮',
+      `${sessA ? 'A' : '-'}${sessB ? 'B' : '-'}`,
+      'AB',
+      '只按 turnId 配对会让两轮不同会话的话拼成一轮（判据 29：一句话只能有一个主人）',
+    )
+    assertEq('T11 只有提问 = unanswered', String(sessA?.state), 'unanswered', '')
+    assertEq('T12 只有答复 = orphan', String(sessB?.state), 'orphan', '')
+
+    // ⑤ 坏行必须被数出来。
+    //    静默跳过会让"记录少了几轮"永远不被发现 —— 而少的那几轮，
+    //    恰好可能是出事的那几轮。
+    const dayFiles = readdirSync(join(tmp, 'data', 'voice')).filter((f) => f.endsWith('.jsonl'))
+    assertEq('T13 落盘文件按天命名', dayFiles.length > 0, true, '')
+    writeFileSync(join(tmp, 'data', 'voice', dayFiles[0]), '{ 这不是 JSON\n', { flag: 'a' })
+    const p3 = readTranscript()
+    assertEq('T14 坏行被数出来', p3.badLines, 1, '静默跳过坏行 = 让"记录缺了几轮"永远不被发现')
+    assertEq('T15 坏行不拖垮好行', p3.turns.length > 1, true, '')
+
+    // ⑥「目录读不了」必须与「没聊过」分开。
+    const root2 = join(tmp, 'broken')
+    mkdirSync(join(root2, 'data'), { recursive: true })
+    writeFileSync(join(root2, 'data', 'voice'), 'not a directory')
+    setTranscriptRoot(root2)
+    assertEq(
+      'T16 目录读不了要说出来',
+      typeof readTranscript().unreadable,
+      'string',
+      '"读不到"与"没聊过"的下一步动作相反：修路径 vs 去聊一句',
+    )
+
+    // ⑦ 写不进去不能沉默，也不能把语音拖垮。
+    resetTranscriptHealth()
+    assertEq('T17 写失败不抛异常', recordUserTurn({ sid: 'x', turnId: 1, text: 'hi', at: Date.now() }), false, '')
+    assertEq(
+      'T18 但写失败要留痕',
+      transcriptHealth().writeFailure !== null,
+      true,
+      '沉默的写失败会让"没有新记录"看起来像"没聊过"',
+    )
+
+    // ⑧ append-only 与「落盘点唯一」—— 这两条只能靠读源码断言。
+    const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const txSrc = strip(readFileSync(join(process.cwd(), 'server/voice/transcript.ts'), 'utf8'))
+    for (const forbidden of ['writeFileSync', 'renameSync', 'unlinkSync', 'rmSync', 'truncateSync']) {
+      if (txSrc.includes(forbidden)) {
+        fail('T19 记录只许追加', `transcript.ts 里出现了 ${forbidden} —— append-only 被破坏，历史记录可以被改写`)
+      }
+    }
+    assertEq(
+      'T19 只允许 appendFileSync',
+      txSrc.split('appendFileSync(').length - 1,
+      1,
+      '没有任何 writeFileSync / rename / unlink：已提交的行永不重命名、永不替换、永不删除',
+    )
+    // 落盘只许发生在会话状态机（唯一必经点）。service 层有 **4 个** commitReply
+    // 调用点，在那一层落盘就是"同一业务动作四条实现路径"（判据 8）。
+    const svcSrc = strip(readFileSync(join(process.cwd(), 'server/voice/service.ts'), 'utf8'))
+    const svcWrites = (svcSrc.match(/record(User|Assistant)Turn\(/g) ?? []).length
+    assertEq('T20 service 层不落盘', svcWrites, 0, 'commitReply 有 4 个调用点 —— 在那一层落盘必然漏掉将来新增的出口')
+
+    // ⑨ 收尾：恢复默认根，并确认默认就是工作目录 ——
+    //    如果有人把默认改成"不记"，生产会静默失去记录能力，而测试全绿。
+    setTranscriptRoot(null)
+    resetTranscriptHealth()
+    assertEq(
+      'T21 生产默认落盘根是工作目录',
+      transcriptRoot(),
+      process.cwd(),
+      '默认"不记"= 生产静默失去记录能力，而所有测试仍然是绿的',
+    )
+
+    // ⑩ 反回归：整个烟测跑下来，**真实记录目录里不许出现本进程的 sid**。
+    //    ★ 这条比"我在这一组里隔离了"强得多：它检查的是**结果**，不是意图 ——
+    //      将来有人在 T 组之前插一组会落盘的用例，或者把 main 开头的隔离删掉，
+    //      这条会立刻红。混进去的假对话在界面上和真的一模一样，
+    //      用户会以为是自己聊的（判据 29：一句话只能有一个主人）。
+    let polluted = 0
+    const realDir = join(process.cwd(), 'data', 'voice')
+    if (existsSync(realDir)) {
+      for (const f of readdirSync(realDir).filter((n) => n.startsWith('turns-'))) {
+        for (const line of readFileSync(join(realDir, f), 'utf8').split('\n')) {
+          if (line.includes(`"${sessionId()}"`)) polluted += 1
+        }
+      }
+    }
+    assertEq(
+      'T22 烟测没有污染真实聊天记录',
+      polluted,
+      0,
+      '假对话写进真实记录后，用户在界面上分不出哪些是自己说的 —— 初版实测漏了 249 行',
+    )
+
+    // 设回临时目录：万一将来在这一组之后还有用例，也不许落到真实目录
+    setTranscriptRoot(tmp)
+
+    pass(
+      'T 对话记录',
+      '生产入口落盘 · 作废答复带原因 · 跨会话不串轮 · 三态互不顶替 · 坏行/读不到/写失败各说各的 · 只追加',
     )
   }
 

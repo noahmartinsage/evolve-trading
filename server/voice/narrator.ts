@@ -147,6 +147,43 @@ function allowedByVerbosity(p: NarrationPriority): boolean {
 }
 
 /**
+ * 直接播报一句话（不走账本事件分类表）。
+ *
+ * ── 为什么需要它，而不是给 `classify()` 再加几个 case ────────────────
+ * `observeEvent` 的形状是「账本 kind → 一句固定文案」，适合**状态变化**。
+ * 但工具执行过程中产生的是**过程叙述**（"开始了 → 拿到 N 条 → 过滤掉 M 条"），
+ * 文案随本轮数据变化，塞进分类表就得为每种工具各写一遍。
+ *
+ * ★ 溯源仍然强制：`seq`/`kind` 必填，指向**已经落账**的那条事件。
+ *   不填就不给播 —— 这一层最像"会撒谎的组件"，而"每条播报都能在审计链里
+ *   找到出处"是本仓库唯一能自动断言它没说谎的性质（见 voice-smoke S9）。
+ *   给一个"可以不填"的口子，等于给这条路开了一条静默降级。
+ */
+export function announce(input: {
+  text: string
+  category: NarrationCategory
+  priority: NarrationPriority
+  /** 已落账事件的 seq —— 强制溯源，不允许省略。 */
+  seq: number
+  kind: string
+  /** 省略时用 `kind + text`，即"同一句话不重复说"。 */
+  dedupeKey?: string
+  ts?: number
+}): NarrationLine | null {
+  const ts = input.ts ?? Date.now()
+  return enqueue({
+    id: '',
+    ts,
+    priority: input.priority,
+    category: input.category,
+    text: input.text,
+    sourceSeq: input.seq,
+    sourceKind: input.kind,
+    dedupeKey: input.dedupeKey ?? `${input.kind}:${input.text}`,
+  })
+}
+
+/**
  * 入队。返回被真正采纳的播报（被抑制时返回 null）。
  *
  * 抑制顺序**故意是**：静音 → 档位 → 冷却 → 限流。

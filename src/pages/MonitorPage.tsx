@@ -3,8 +3,11 @@ import { useStore, pushToast } from '../store/Store'
 import KpiRow, { KpiItem } from '../components/KpiRow'
 import { VenueStatusPanel } from '../components/VenueStatusPanel'
 import { useOrch, useOrchEvents, setKillswitch, submitOrderIntent, cancelOrchOrder, listPromotions, promotionAction, getMetrics, getSlo, getMirrorStatus, getSurveillance, getAutopilotStatus, autopilotStart, autopilotStop } from '../orch/client.ts'
-import type { OrchEvent, PromotionRecordView, MetricsView, SloView, MirrorStatusView, SurveillanceView, AutopilotStatusView } from '../orch/client.ts'
+import type { OrchEvent, PromotionRecordView, MetricsView, SloView, AlertWebhookView, MirrorStatusView, SurveillanceView, AutopilotStatusView } from '../orch/client.ts'
 import { explainDecision } from '../orch/explain.ts'
+import { PROMOTION_STAGE_LABEL } from '../engine/promotion.ts'
+import { getVoiceTelegram, setVoiceTelegramChat } from '../voice/client.ts'
+import type { TelegramView } from '../voice/clientTypes.ts'
 
 /**
  * 定时器 hook。
@@ -72,25 +75,69 @@ function fmtMoney(n: number): string {
   return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 })
 }
 
+/**
+ * 告警通道的状态标签。
+ *
+ * ★ 分类**只认服务端给的 `outcome` 枚举**，界面只负责措辞。
+ *   在界面里重新判断"这条 note 算不算被拦"会造出**第二个主人** ——
+ *   服务端分了四档（`not-configured` / `sent` / `blocked` / `failed`），
+ *   界面再猜一次，两边迟早会分岔（判据 ⑯/D2）。
+ *
+ * ★★ 用 `Record<outcome, …>` 而不是一串 `if`：服务端哪天加了第五档，
+ *    这里会**编译不过**，而不是安静地掉进兜底那句"没发出去" ——
+ *    一个"看着完全正常"的错标签比一个显眼的编译错误贵得多。
+ */
+const ALERT_OUTCOME_LABEL: Record<AlertWebhookView['outcome'], (w: AlertWebhookView) => string> = {
+  sent: (w) => `已送出（${w.host}）`,
+  'not-configured': () => '未配置 ALERT_WEBHOOK_URL',
+  blocked: (w) => `${w.host} 被出网白名单拦下`,
+  failed: (w) => `没发出去（${w.host || '未知目标'}）`,
+}
+
+/**
+ * ★ 三态，不许退化成两态（判据 C7）：
+ *   · 有值          ⇒ 这一次/最近一次外发的结局；
+ *   · `null`        ⇒ **从没触发过告警**（不是"通道正常"）；
+ *   · `undefined`   ⇒ 编排器还是旧版本，这个读数**压根不存在**。
+ *   中间那两档曾经被写成同一句话。后果是：一个**版本没对上**的编排器
+ *   会被显示成"还没触发过告警" —— 一句看着完全合理、但完全不成立的话。
+ */
+function alertChannelLabel(w: SloView['alertWebhook']): string {
+  if (w === undefined) return '编排器版本过旧（无此读数）'
+  if (w === null) return '还没触发过告警'
+  return ALERT_OUTCOME_LABEL[w.outcome](w)
+}
+
+function alertChannelColor(w: SloView['alertWebhook']): string {
+  // 读不到 ≠ 正常：两个"没有值"的档都要看得出来（判据 C7）。
+  if (w === undefined) return 'var(--warning)'
+  if (w === null) return 'var(--text-weak)'
+  if (w.outcome === 'sent') return 'var(--down)'
+  // 「没接」与「坏了」分开：前者是配置取舍（黄），后者要人立刻查（红）。
+  if (w.outcome === 'not-configured') return 'var(--warning)'
+  return 'var(--up)'
+}
+
 const STAGE_COLOR: Record<string, string> = {
   candidate: 'var(--text-sub)',
   rejected: 'var(--up)',
   paper_observing: 'var(--primary)',
   ready_for_small_cap: 'var(--warning)',
+  testnet_verifying: 'var(--warning)',
+  testnet_verified: 'var(--primary)',
   small_cap_live: 'var(--accent)',
   full_live: 'var(--down)',
   rolled_back: 'var(--text-weak)',
 }
 
-const STAGE_LABEL: Record<string, string> = {
-  candidate: '候选',
-  rejected: '已拒绝',
-  paper_observing: '纸交易观察中',
-  ready_for_small_cap: '待审批',
-  small_cap_live: '小资金实盘',
-  full_live: '全量',
-  rolled_back: '已回滚',
-}
+// 中文名只有一份，住在状态机旁边（`src/engine/promotion.ts`）。
+// 这里不再保留本地副本 —— 改造前本地那份缺 testnet_*，配合 `?? r.stage` 兜底，
+// 会让走到测试网阶段的策略在界面上显示英文原值，而且没有任何东西会报红。
+//
+// 放宽成 `Record<string, string>` 是刻意的：`r.stage` 来自网络响应，
+// 类型上是 `string`。真正的"每个 Stage 都有中文名"由 `promotion-smoke` 对
+// 源头那份 `PROMOTION_STAGE_LABEL` 断言，而不是靠这里的索引类型。
+const STAGE_LABEL: Record<string, string> = PROMOTION_STAGE_LABEL
 
 function PromotionsPanel({ base, token, online, dispatch }: { base: string; token: string; online: boolean; dispatch: ReturnType<typeof useStore>['dispatch'] }) {  const [records, setRecords] = useState<PromotionRecordView[]>([])
   const [newId, setNewId] = useState('')
@@ -214,6 +261,157 @@ function PromotionsPanel({ base, token, online, dispatch }: { base: string; toke
   )
 }
 
+/**
+ * 手机端通道（Telegram）—— 放行 / 收回。
+ *
+ * ══ 这个面板为什么必须存在（不是为了好看）═════════════════════════════
+ * 通道开通动作的**唯一**入口就是这里。它不存在的话，桌宠在被陌生人敲门时
+ * 回的那句「去监控页的「Telegram」一栏点放行」就是一句**假话** ——
+ * 而用户会照着这句话去找一个不存在的按钮（判据 D7：这个输出把用户
+ * 引向哪个动作？那个动作有用吗？）。
+ *
+ * ══ 三处刻意的设计 ═══════════════════════════════════════════════════
+ * ① **不自动放行、也不做"第一个来的就是主人"**：放行只能由人点。
+ *    这个 bot 的 username 是可被搜到的，任何自动绑定都等于把下单权交出去。
+ * ② **收回按钮与放行按钮并列**：只能加不能减的权限表是一个死门 ——
+ *    抄错一位数字之后，用户的唯一补救手段是手工改 JSON 文件。
+ * ③ **把人话（`speech`）原样显示**：四种坏法（没配 token / 名单空 /
+ *    文件坏了 / 连不上）在纯数字上长得一模一样，而处置动作四条完全不同。
+ *    这段话是服务端给的唯一一份口径，前端不自己拼第二份。
+ */
+function TelegramPanel({ base, token, online, dispatch }: { base: string; token: string; online: boolean; dispatch: ReturnType<typeof useStore>['dispatch'] }) {
+  const [view, setView] = useState<TelegramView | null>(null)
+  const [busy, setBusy] = useState('')
+
+  useEffect(() => {
+    if (!online) {
+      setView(null)
+      return
+    }
+    let alive = true
+    const load = () => {
+      void getVoiceTelegram(base, token)
+        .then((r) => {
+          if (alive) setView(r)
+        })
+        .catch(() => undefined)
+    }
+    load()
+    const t = setInterval(load, 5000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [base, token, online])
+
+  const act = async (action: 'allow' | 'revoke', chatId: string, label = '') => {
+    setBusy(`${action}:${chatId}`)
+    try {
+      // ★ 用服务端返回的**整份视图**替换本地状态，而不是"我自己改一下数组"。
+      //   乐观更新在这里特别坏：名单是安全边界，界面说"已放行"而磁盘没写进去，
+      //   用户会以为开通了、然后在手机上等一条永远不会来的回复。
+      const r = await setVoiceTelegramChat(base, token, action, chatId, label)
+      setView(r)
+      pushToast(dispatch, action === 'allow' ? `✅ 已放行 ${chatId}` : `✅ 已收回 ${chatId}`)
+    } catch (e) {
+      pushToast(dispatch, `❌ ${e instanceof Error ? e.message : e}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const chip = (ok: boolean, on: string, off: string) => (
+    <span className={`chip ${ok ? 'chip-green' : 'chip-amber'}`}>{ok ? on : off}</span>
+  )
+
+  return (
+    <div className="panel-card">
+      <div className="pc-head">
+        <span className="panel-title">手机端通道（Telegram）</span>
+        {view && (
+          <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {chip(view.configured, '● 已配 token', '○ 没配 token')}
+            {chip(view.polling, '● 在收消息', '○ 没在收')}
+            <span className={`chip ${view.allowedChats > 0 ? 'chip-cyan' : 'chip-amber'}`}>放行 {view.allowedChats} 个会话</span>
+          </span>
+        )}
+      </div>
+
+      {!view && <div className="empty-row">{online ? '读取中…' : '编排器离线'}</div>}
+
+      {view && (
+        <>
+          {/* 人话：服务端给的唯一一份口径。四种坏法的处置动作完全不同，
+              而它们在纯数字上一模一样。 */}
+          <div className="pi-meta" style={{ margin: '6px 0 10px' }}>{view.speech}</div>
+
+          {view.chatListError && (
+            <div className="op-err" style={{ marginBottom: 8 }}>
+              ⚠️ 放行名单文件有问题：{view.chatListError}
+              <div className="pi-meta" title={view.chatFile}>文件：{view.chatFile}</div>
+            </div>
+          )}
+
+          <div className="pi-meta" style={{ marginBottom: 4 }}>
+            已处理 {view.handled} 条 · 挡下 {view.rejected} 条 · 轮询 {view.polls} 次
+            {view.failures > 0 ? ` · 连续失败 ${view.failures} 次` : ''}
+          </div>
+          {view.lastError && <div className="op-err" style={{ marginBottom: 8 }}>最近一次失败：{view.lastError}</div>}
+
+          {/* ── 待放行（敲过门但没被放行）────────────────────────────── */}
+          <div className="panel-title" style={{ fontSize: 12, margin: '8px 0 4px' }}>待放行的会话</div>
+          {view.pending.length === 0 && (
+            <div className="empty-row">还没有人敲过门。在手机上给这个 bot 发一句话，它的会话就会出现在这里。</div>
+          )}
+          {view.pending.map((c) => (
+            <div key={c.chatId} className="promo-item">
+              <div className="pi-head">
+                <span className="mono pi-id">{c.chatId}</span>
+                <button
+                  className="btn btn-sm btn-primary"
+                  disabled={!online || busy !== ''}
+                  onClick={() => void act('allow', c.chatId, c.name)}
+                >
+                  {busy === `allow:${c.chatId}` ? '放行中…' : '放行这个会话'}
+                </button>
+              </div>
+              <div className="pi-meta">
+                {c.name || '（没设用户名）'} · 敲了 {c.tries} 次
+              </div>
+            </div>
+          ))}
+
+          {/* ── 放行名单（能点名的对象才能被收回）────────────────────── */}
+          <div className="panel-title" style={{ fontSize: 12, margin: '10px 0 4px' }}>已放行</div>
+          {view.allowedIds.length === 0 && <div className="empty-row">名单是空的 —— 现在谁都不能通过手机下指令。</div>}
+          {view.allowedIds.map((id) => (
+            <div key={id} className="promo-item">
+              <div className="pi-head">
+                <span className="mono pi-id">{id}</span>
+                <button
+                  className="btn btn-sm"
+                  disabled={!online || busy !== ''}
+                  onClick={() => void act('revoke', id)}
+                >
+                  {busy === `revoke:${id}` ? '收回中…' : '收回'}
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {!view.configured && (
+            <div className="pi-meta" style={{ marginTop: 8 }}>
+              开通方法：在 Telegram 里找 @BotFather 建一个 bot，把它的 token 放进环境变量
+              <code> TELEGRAM_BOT_TOKEN </code>，重启编排器；然后在手机上给这个 bot 发一句话，
+              它会把你的 chat id 回给你，再到这里点「放行」。
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 function AutopilotLivePanel({ ap, target, setTarget, busy, setBusy, base, token, dispatch }: {
   ap: AutopilotStatusView | null
   target: string
@@ -288,8 +486,8 @@ function AutopilotLivePanel({ ap, target, setTarget, busy, setBusy, base, token,
       </div>
       <div className="ap-controls">
         <input className="input" style={{ width: 70 }} value={target} onChange={(e) => setTarget(e.target.value)} placeholder="目标%" />
-        <button className="btn btn-sm" disabled={busy || ap?.running} onClick={onStart}>▶ 启动</button>
-        <button className="btn btn-sm" disabled={busy || !ap?.running} onClick={onStop}>⏹ 停止</button>
+        <button className="btn btn-sm" data-ui="monitor.autopilot.start" disabled={busy || ap?.running} onClick={onStart}>▶ 启动</button>
+        <button className="btn btn-sm" data-ui="monitor.autopilot.stop" disabled={busy || !ap?.running} onClick={onStop}>⏹ 停止</button>
       </div>
     </div>
   )
@@ -671,6 +869,8 @@ export default function MonitorPage() {
 
             <PromotionsPanel base={state.orchUrl} token={state.orchToken} online={orch.status === 'online'} dispatch={dispatch} />
 
+            <TelegramPanel base={state.orchUrl} token={state.orchToken} online={orch.status === 'online'} dispatch={dispatch} />
+
             <div className="panel-card">
               <div className="pc-head"><span className="panel-title">持仓（服务端账本）</span></div>
               <table className="tbl">
@@ -792,6 +992,15 @@ export default function MonitorPage() {
                   </div>
                 )
               })}
+              {/* ★ 告警通道的状态必须有一个**有人读**的出口。它坏掉之后，外表与
+                  "系统一直很健康"完全一样 —— 两种情形都是"屏幕上没有任何告警"。
+                  `title` 带上服务端那句完整说明，界面不重写它（同一句话只有一个主人）。 */}
+              <div className="risk-row">
+                <span>告警通道</span>
+                <span className="mono" title={slo?.alertWebhook?.note ?? ''} style={{ color: alertChannelColor(slo?.alertWebhook) }}>
+                  {alertChannelLabel(slo?.alertWebhook)}
+                </span>
+              </div>
               <div className="risk-note">违约自动写入审计事件并触发告警通道（冷却去重）</div>
             </div>
 

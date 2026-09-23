@@ -32,8 +32,16 @@ export {
   validateHistory,
 } from './history.ts'
 export type { HistoryMeta, HistoryFile, HistoryGap } from './history.ts'
-export { walkForward, combinationPurity, computeOverfitReceipt } from './walkforward.ts'
-export type { WFConfig, WFFold, WFAggregate, WFResult, WFOptions, PurityResult } from './walkforward.ts'
+export {
+  walkForward,
+  combinationPurity,
+  computeOverfitReceipt,
+  wfWidthFor,
+  OVERFIT_CALIBRATION_FOLDS,
+  WF_MIN_TRAIN_BARS,
+  WF_MIN_TEST_BARS,
+} from './walkforward.ts'
+export type { WFConfig, WFFold, WFAggregate, WFResult, WFOptions, PurityResult, WfWidth } from './walkforward.ts'
 export {
   OVERFIT_VERSION,
   DEFAULT_OVERFIT_THRESHOLDS,
@@ -63,6 +71,90 @@ export {
 export type { TailRiskSummary } from './riskMetrics.ts'
 export { PaperBroker } from './broker.ts'
 export type { BrokerClient, OrderRequest, SubmitResult } from './broker.ts'
+export {
+  FACTOR_BASES,
+  FACTOR_TRANSFORMS,
+  DEFAULT_FACTOR_GATE,
+  DEFAULT_HORIZONS,
+  DEFAULT_WINDOWS,
+  FACTOR_MIN_WINDOW,
+  minWindowFor,
+  SPEARMAN_MIN_PAIRS,
+  rankCorr,
+  factorSeries,
+  factorLooksAhead,
+  looksAhead,
+  spearman,
+  computeFactorMetrics,
+  judgeFactor,
+  generateFactorBatch,
+  evaluateFactorBatch,
+  slugFor,
+} from './factorEval.ts'
+export type {
+  FactorOrigin,
+  FactorSpec,
+  FactorMetrics,
+  FactorVerdict,
+  FactorVerdictState,
+  FactorGateThresholds,
+  FactorGateInput,
+  LookaheadVerdict,
+  EvalOptions,
+  BatchEntry,
+  BatchResult,
+  FactorBaseDef,
+} from './factorEval.ts'
+export {
+  FACTOR_STRATEGY_VERSION,
+  DEFAULT_FACTOR_STRATEGY_WF,
+  DEFAULT_FACTOR_STRATEGY_GATE,
+  normalizeSignal,
+  signalKey,
+  factorTimingStrategy,
+  deriveSignFromTrain,
+  evaluateFactorStrategy,
+  summarizeStrategyFolds,
+  COST_DRAG_LABEL,
+  COST_DRAG_NOTE,
+  COST_PER_FILL_LABEL,
+  EDGE_PER_FILL_LABEL,
+  PER_FILL_NOTE,
+  judgeFactorStrategy,
+  screenFactorStrategy,
+} from './factorStrategy.ts'
+export type {
+  FactorTimingOptions,
+  SignDerivation,
+  FactorStrategyFold,
+  FactorStrategyReceipt,
+  FactorStrategyConfig,
+  FactorStrategyThresholds,
+  FactorStrategyOutcome,
+  FactorStrategyVerdict,
+  FactorStrategyScreenResult,
+} from './factorStrategy.ts'
+export {
+  DEFAULT_CROSS_SECTION_GATE,
+  alignPanel,
+  projectFactor,
+  pooledIc,
+  crossSectionBacktest,
+  judgeCrossSection,
+} from './crossSection.ts'
+export type {
+  PanelInput,
+  Panel,
+  IcPoint,
+  IcOptions,
+  PooledIcResult,
+  CrossSectionConfig,
+  CrossSectionLogRow,
+  CrossSectionResult,
+  CrossSectionThresholds,
+  CrossSectionOutcome,
+  CrossSectionVerdict,
+} from './crossSection.ts'
 export {
   PromotionPipeline,
   DEFAULT_PIPELINE_CONFIG,

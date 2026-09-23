@@ -28,9 +28,23 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { networkInterfaces } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
-import { DEFAULT_PORTS, createStack, renderExitReport, stackRoles, stampLocal, waitForHealth } from '../server/stackCore.ts'
+import {
+  DEFAULT_PORTS,
+  DEV_TOKEN,
+  createStack,
+  renderExitReport,
+  renderLoopbackTries,
+  renderRuntimeSummary,
+  resolveLoopbackService,
+  stackRoles,
+  stampLocal,
+  waitForHealth,
+  waitForLoopbackService,
+  type RuntimeProbe,
+} from '../server/stackCore.ts'
 import { loadDotEnv } from '../server/loadEnv.ts'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -43,6 +57,54 @@ const NO_PET = ARGS.has('--no-pet')
 const FORCE_BUILD = ARGS.has('--force-build')
 const NO_BROWSER = ARGS.has('--no-browser')
 const ALLOW_LIVE = process.env.EVOLVE_ALLOW_LIVE === '1'
+
+/**
+ * ★★ `.env` 必须在**取任何配置之前**加载完。
+ *
+ *   这里原来排在第 96 行（`say()` / `stamp()` 那些工具函数定义完之后），
+ *   而 `const TOKEN = process.env.ORCH_TOKEN ?? DEV_TOKEN` 排在第 70 行 ——
+ *   于是 `.env` 里写的 `ORCH_TOKEN` **永远读不到**，启动器一律用默认令牌，
+ *   而它还会在控制台把那个默认令牌**印出来**（"令牌 dev-insecure-token"）。
+ *   下面那段注释本来就是为了防"两处各算一次"，结果同一类问题换了个入口又来了一遍：
+ *   写在 `.env` 里的令牌被静默忽略 —— 而用户以为自己已经换成真令牌了。
+ *   （判据 D7：如果这个值没被采纳，用户要靠什么看出来？）
+ */
+loadDotEnv(join(ROOT, '.env'))
+
+/**
+ * 编排层令牌。**只在这里取一次，然后显式喂给两个地方**（子进程环境 / 探针请求头）。
+ *
+ * ★ 原来两个地方各算一次：子进程走 `stackRoles()` 的默认值（DEV_TOKEN），
+ *   而启动器自己打印时读 `process.env.ORCH_TOKEN`。这两个表达式**在绝大多数
+ *   机器上得到同一个字符串**，所以看不出问题；但只要外部 shell 导出了
+ *   `ORCH_TOKEN`，启动器就会拿一个服务不认的令牌去问，得到 401 ——
+ *   而它会把这解释成"读不到运行态"，用户看到的是三行 ⚠。
+ *   同一件事的凭据只能有一个来源（判据 8）。
+ */
+const TOKEN = process.env.ORCH_TOKEN ?? DEV_TOKEN
+
+/**
+ * 远程模式：允许**别的设备**（手机）连前端。
+ *
+ * ★★ 开关本身不危险，"开关 + 公开默认令牌"才危险：编排层本来就监听所有网卡，
+ *   而前端只是它的遥控器。所以这一组合在**起任何服务之前**就拒掉 ——
+ *   fail-closed，且条件窄到只有"既要远程、又没换令牌"这一个（判据 4）。
+ *   拒绝发生在 `mkdir` / `stack.start()` 之前，不会留下半启动的栈。
+ */
+const REMOTE = process.env.EVOLVE_REMOTE === '1'
+if (REMOTE && TOKEN === DEV_TOKEN) {
+  console.error('')
+  console.error('❌ EVOLVE_REMOTE=1，但 ORCH_TOKEN 还是默认的公开令牌。')
+  console.error('   开了远程就等于把出单端点挂到路由器上：同一个 WiFi 底下任何人都能')
+  console.error('   用它出单，也能把自己的 Telegram 会话放行成主人。')
+  console.error('')
+  console.error('   请先在 .env 里设一个只有你知道的令牌，再启动：')
+  console.error('     ORCH_TOKEN=<随机串>')
+  console.error('   生成一个：node -e "console.log(require(\'node:crypto\').randomBytes(24).toString(\'hex\'))"')
+  console.error('')
+  console.error('   只想本机用？把 EVOLVE_REMOTE 去掉或设成 0 即可。')
+  process.exit(1)
+}
 
 mkdirSync(DATA_DIR, { recursive: true })
 
@@ -67,8 +129,9 @@ function say(line: string): void {
   }
 }
 
-// `loadDotEnv` 只补 process.env 里还没有的键 ⇒ 显式设过的值赢。
-loadDotEnv(join(ROOT, '.env'))
+// ★ `.env` 的加载**已经挪到文件上方**（取 `TOKEN` 之前）——
+//   `loadDotEnv` 只补 `process.env` 里还没有的键，所以顺序决定了它到底有没有用。
+//   放在这里等于完全失效：`TOKEN` 那时已经算完了。
 
 /**
  * 桌面壳自己写的那些变量**不要**带进来。
@@ -97,6 +160,29 @@ function newestSourceMtime(dir: string, depth = 0): number {
     }
   }
   return newest
+}
+
+/**
+ * 本机能被**别的设备**连上的地址（内网 IPv4）。没有就返回空数组。
+ *
+ * ★ 为什么要筛：`ipconfig` 里排在前面的常常是虚拟网卡（WSL / VirtualBox / VPN），
+ *   那个地址手机连不上，表现是"页面一直转圈" —— 用户会去查防火墙，而问题在这里。
+ *   `internal: true` 的是回环，手机上写它等于写"手机自己"，所以一起去掉。
+ * ★ 拿不到时说"拿不到"，不编一个地址出来（判据 ㉟：`null` 不许退化成 0）。
+ */
+function lanAddresses(): string[] {
+  const out: string[] = []
+  try {
+    for (const list of Object.values(networkInterfaces())) {
+      for (const ni of list ?? []) {
+        if (ni.family !== 'IPv4' || ni.internal) continue
+        out.push(ni.address)
+      }
+    }
+  } catch {
+    return []
+  }
+  return out
 }
 
 /** 单个文件的 mtime；不存在返回 0（"比任何产物都旧"）。 */
@@ -153,6 +239,62 @@ function openBrowser(url: string): void {
   }
 }
 
+/**
+ * 从**已经起来的编排层**读回运行态。
+ *
+ * ★ 这里是启动器与"汇报"之间最容易出事的地方：启动器想说的话（"自循环常开"
+ *   "账号池就绪"）都是**关于服务内部**的，而它自己看不到那些内部状态。
+ *   如果这里改成"打印常量"，那么额度爆掉、循环被关掉、账号没配的时候，
+ *   启动器会照样一片绿 —— 用户据此判断"系统在跑"，而它其实什么也做不了。
+ *   ⇒ 只打印读回来的东西；读不到就把**读不到**和**原因**打出来（判据 13：
+ *   「没有能力」与「没有额度」必须分得清）。
+ */
+async function probeRuntime(): Promise<RuntimeProbe> {
+  // ★ 地址不写死成 `127.0.0.1`（原来就是写死的，于是**连到了别人的服务上**：
+  //   本机实测 `127.0.0.1:8790` 被隔壁工作区的 dash 服务占着，我们的编排层在 `[::1]` 那边）。
+  //   现在先问「你是谁」，再拿这个地址去读 —— 读到的才可能是我们自己的东西。
+  const res = await resolveLoopbackService(DEFAULT_PORTS.orch, '/healthz', 'orch')
+  const sq = res.tries.filter((t) => !t.ours && t.answered).map((t) => t.url + ' → ' + t.verdict)
+  const errors: NonNullable<RuntimeProbe['errors']> = {}
+  if (res.base === null) {
+    // 连"我们是哪个地址"都没定下来 ⇒ 三项都读不到，且**原因必须带上逐条判定**
+    // （否则用户只看到三行"读不到"，不知道下一步去查谁）。
+    const why = '找不到我们自己的编排层：\n' + renderLoopbackTries(res.tries).join('\n')
+    for (const k of ['fleet', 'autonomy', 'news'] as const) errors[k] = why
+    return { fleet: null, autonomy: null, news: null, errors, base: null, squatters: sq }
+  }
+  const base = res.base
+  const token = TOKEN
+  const get = async (path: string, name: 'fleet' | 'autonomy' | 'news'): Promise<Record<string, unknown> | null> => {
+    try {
+      const r = await fetch(base + path, { headers: { 'x-orch-token': token }, signal: AbortSignal.timeout(5000) })
+      if (!r.ok) {
+        errors[name] = 'HTTP ' + String(r.status)
+        return null
+      }
+      return (await r.json()) as Record<string, unknown>
+    } catch (e) {
+      errors[name] = e instanceof Error ? e.message : String(e)
+      return null
+    }
+  }
+  const [fleet, autonomy, news] = await Promise.all([
+    get('/fleet', 'fleet'),
+    get('/fleet/autonomy', 'autonomy'),
+    // 取 5 条而不是 1 条：要印的是"最新的一条"，而最新的一条在**末尾**，
+    // 只取 1 条就只剩最旧的那条可印。取 5 也让"这几天读到几条"有个量。
+    get('/fleet/news?limit=5', 'news'),
+  ])
+  return {
+    fleet: fleet as RuntimeProbe['fleet'],
+    autonomy: autonomy as RuntimeProbe['autonomy'],
+    news: news as RuntimeProbe['news'],
+    errors,
+    base,
+    squatters: sq,
+  }
+}
+
 async function main(): Promise<void> {
   say('════ EVOLVE 启动 ════')
   say('· 目录 ' + ROOT)
@@ -176,12 +318,13 @@ async function main(): Promise<void> {
   if (ALLOW_LIVE) say('⚠ EVOLVE_ALLOW_LIVE=1：编排层会走实盘通路（这是你显式要求的）。')
   else say('· 实盘通路按死为 false（要开请设 EVOLVE_ALLOW_LIVE=1）')
 
-  const roles = stackRoles({ web: 'preview', venue: process.env.VENUE ?? 'sandbox', overrides })
-  const health: Record<string, string> = {
-    ledger: 'http://127.0.0.1:' + DEFAULT_PORTS.ledger + '/healthz',
-    orch: 'http://127.0.0.1:' + DEFAULT_PORTS.orch + '/healthz',
-    web: 'http://127.0.0.1:' + DEFAULT_PORTS.web + '/',
-  }
+  const roles = stackRoles({
+    web: 'preview',
+    venue: process.env.VENUE ?? 'sandbox',
+    overrides,
+    token: TOKEN,
+    remote: REMOTE,
+  })
 
   /**
    * 每个角色的健康检查预算 —— **必须比该角色的正常启动耗时宽出一个量级**。
@@ -200,17 +343,43 @@ async function main(): Promise<void> {
   for (const role of roles) {
     stack.start(role)
     const budget = HEALTH_BUDGET_MS[role.name] ?? 30_000
-    const ok = await waitForHealth(health[role.name], budget)
-    if (!ok) {
-      say('✗ [' + role.name + '] ' + String(Math.round(budget / 1000)) + ' 秒内没有起来（' + health[role.name] + '）。上面是它的输出。')
+
+    if (role.name === 'web') {
+      // ★ web（vite preview）是**唯一**允许"只要有人应答就算就绪"的角色：
+      //   它没有自报身份的端点。另两个角色都必须认身份 —— 端口上可能坐着别人的服务
+      //   （本机实测，见 serviceIdentity.ts），此时"通了"是假绿。
+      const ok = await waitForHealth('http://127.0.0.1:' + DEFAULT_PORTS.web + '/', budget)
+      if (!ok) {
+        say('✗ [web] ' + String(Math.round(budget / 1000)) + ' 秒内没有起来（http://127.0.0.1:' + DEFAULT_PORTS.web + '/）。上面是它的输出。')
+        say('  （若提示端口被占：4173 上还挂着上一次没退干净的进程，先跑 STOP-EVOLVE.cmd）')
+        stack.shutdown(1)
+        return
+      }
+      say('· [web] 就绪 http://127.0.0.1:' + DEFAULT_PORTS.web + '/（vite 不报身份，这一条只用"有人应答"判）')
+      continue
+    }
+
+    const svcRole = role.name as 'ledger' | 'orch'
+    const res = await waitForLoopbackService(DEFAULT_PORTS[svcRole], '/healthz', svcRole, budget)
+    if (res.base === null) {
+      say('✗ [' + role.name + '] ' + String(Math.round(budget / 1000)) + ' 秒内没有起来。上面是它的输出。')
+      say('  逐条判定（端口 ' + String(DEFAULT_PORTS[svcRole]) + '）：')
+      for (const line of renderLoopbackTries(res.tries)) say(line)
+      say('  ⇒ 「有人但不是我们」= 去查是谁占了端口；「没人应答」= 才是我们的服务没起来。**这两件事要做的事相反。**')
       if (role.name === 'orch') {
         say('  （它启动时要同步预热过拟合证据，实测约 21~22 秒；若上面停在"过拟合证据已预热"之后，多半是历史数据拉取或 venue 握手卡住）')
       }
-      if (role.name === 'web') say('  （若提示端口被占：4173 上还挂着上一次没退干净的进程，先跑 STOP-EVOLVE.cmd）')
       stack.shutdown(1)
       return
     }
-    say('· [' + role.name + '] 就绪 ' + health[role.name])
+
+    say('· [' + role.name + '] 就绪 ' + res.base + '/healthz（自报身份 = 我们自己的）')
+    // ★ 找到自己的了，但另一条回环地址上坐着别人 —— 这不是本次启动的问题，
+    //   是**下一个**去连那条地址的工具的坑（它会读到别人的数据，而端点看着"通"）。
+    //   本机真实发生过（隔壁工作区的 dash 服务占着 127.0.0.1:8790），所以每次启动都印出来。
+    for (const t of res.tries) {
+      if (!t.ours && t.answered) say('  ⚠ ' + t.url + ' 上是**别人的服务**：' + t.verdict + '（谁连它，谁就拿到别人的数据）')
+    }
   }
 
   writeFileSync(
@@ -220,9 +389,30 @@ async function main(): Promise<void> {
   )
 
   const panelUrl = 'http://localhost:' + DEFAULT_PORTS.web + '/'
+
+  // ── 运行态：从活着的服务读回来 ────────────────────────────────────
+  say('')
+  for (const line of renderRuntimeSummary(await probeRuntime())) say(line)
+
   say('')
   say('  控制台   ' + panelUrl)
-  say('  编排 API http://localhost:' + DEFAULT_PORTS.orch + '（令牌 ' + (process.env.ORCH_TOKEN ?? 'dev-insecure-token') + '）')
+  say('  编排 API http://localhost:' + DEFAULT_PORTS.orch + '（令牌 ' + TOKEN + '）')
+  if (REMOTE) {
+    // ★ 手机要照着一个**真的存在**的地址输。不印的话用户只能自己去 ipconfig 里翻，
+    //   而翻出来的可能是虚拟网卡（WSL / VirtualBox / VPN）—— 那个地址手机连不上，
+    //   表现是"一直转圈"，用户会以为是防火墙的问题。
+    // ★ 只列内网 IPv4：回环手机上没意义，外网地址不是手机要用的那个。
+    const lan = lanAddresses()
+    if (lan.length === 0) {
+      say('⚠ EVOLVE_REMOTE=1，但没找到内网 IPv4 地址 —— 手机可能连不上（VPN / 虚拟网卡会让它更复杂）。')
+    } else {
+      const pet = '?pet=1'
+      say('  📱 手机（同一个 WiFi）   ' + lan.map((a) => 'http://' + a + ':' + DEFAULT_PORTS.web + '/').join('  '))
+      say('     桌宠形态（手机）      ' + lan.map((a) => 'http://' + a + ':' + DEFAULT_PORTS.web + '/' + pet).join('  '))
+      say('     手机上打开后，把「连接」里的地址改成  http://' + lan[0] + ':' + DEFAULT_PORTS.orch)
+      say('     令牌就填上面那个（本机 .env 里 ORCH_TOKEN 的值）')
+    }
+  }
   say('  口令怎么用  在控制台或桌宠里说/写一个目标 → 裁定为可行时会给四位口令 → 说「确认启动 四位数字」')
   say('')
   if (!NO_BROWSER) openBrowser(panelUrl)

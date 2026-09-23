@@ -14,6 +14,75 @@ import {
 } from './overfit.ts'
 import type { OverfitReceipt, OverfitThresholds, OverfitVerdict, PboResult } from './overfit.ts'
 
+/**
+ * 折宽（训练窗 / 验证窗的根数）。
+ */
+export interface WfWidth {
+  trainBars: number
+  testBars: number
+}
+
+/**
+ * 阈值标定时的**折数口径** —— 不许随意改。
+ *
+ * `overfit.ts` 的默认阈值是在这个折数上标定的，原文：
+ *   「赢家分位同理：均匀名次下 **8 折**均值 ≈0.5、σ≈0.10，
+ *     0.60 = 0.50 + 1.0×0.10 → 单条误放行 ~16%」
+ * 也就是说 `minAvgWinnerW = 0.6` 这条线只在 8 折口径下才有那个误放行率。
+ *
+ * 2026-09-18 实测：同一份行情、同一批候选，只把折宽从 960/240 改成
+ * 14400/4800，裁定就从 REJECT 翻成 PASS（赢家分位 0.547 → 0.774）。
+ * 所以折宽不是"性能参数"，它是**判据的适用条件**。
+ */
+export const OVERFIT_CALIBRATION_FOLDS = 8
+
+/**
+ * 折宽的**绝对下限** —— 取自原始口径（2,880 根上的 960 / 240）。
+ *
+ * ★ 为什么必须有下限：没有它，`trainBars = bars / 3` 在极小样本上会给出
+ *   「320 根数据切成 8 折、每折训练窗 106 根」这种荒谬切法 —— 而门不会报错，
+ *   它会**一本正经地给出 PASS / REJECT**。
+ *
+ *   这不是假设。2026-09-18 实测就是这么被抓住的：`test:autopilot` 的 S7
+ *   喂约 320 根 K 线，期望 `UNVERIFIABLE`（样本不足以切折），实得 `REJECT`。
+ *   根因是折数被 _上面两行_ 之外的代码固定住了 ⇒ 「样本不足」那道门
+ *   （`minFolds`）**永远不可能触发** —— 又一道不可能变红的检查。
+ *
+ *   所以下限的作用正是：**数据不够时让折数自然变少**，把 `minFolds` 还给系统。
+ */
+export const WF_MIN_TRAIN_BARS = 960
+export const WF_MIN_TEST_BARS = 240
+
+/**
+ * 按数据长度反推折叠宽度 —— **唯一出处**。
+ *
+ * ══ 为什么不能写死 bar 数 ═════════════════════════════════════════
+ * 原先 autopilot 与 evidence 各写死一份 `960/240`。它是在
+ * **2,880 根（30 天）** 上标定的：训练窗占 1/3、得 8 折。
+ * 把真实历史扩到 35,040 根（12 个月）之后，同样的 960/240 给出
+ * **142 折**，而每折训练窗仍是 10 天 —— 折数涨了 17.75 倍，
+ * 同时把判据的标定条件悄悄破坏了（见 `OVERFIT_CALIBRATION_FOLDS`）。
+ *
+ * 两条约束（训练窗占 1/3、折数 = 8）在 2,880 根上**同时**成立，
+ * 所以它们共同确定了一个唯一解，而它随数据长度自然伸缩：
+ *
+ *   | bar 数 | trainBars | testBars | 折数 | 训练窗 |
+ *   |--------|-----------|----------|------|--------|
+ *   |  2,880 |       960 |      240 |   8  |  10 天 |  ← 与原口径逐位相同
+ *   | 35,040 |    11,680 |    2,920 |   8  | 121 天 |
+ *
+ * ★ 2,880 根那一行是一条**可断言的性质**：这个函数在原始数据规模上必须
+ *   逐位退化成 `{ trainBars: 960, testBars: 240 }`。
+ *   它把"我没改变原有行为"变成一条能变红的检查，而不是一句"应该没影响"。
+ */
+export function wfWidthFor(bars: number, targetFolds = OVERFIT_CALIBRATION_FOLDS): WfWidth {
+  if (!Number.isFinite(bars) || bars < 12) return { trainBars: WF_MIN_TRAIN_BARS, testBars: WF_MIN_TEST_BARS }
+  const folds = Math.max(1, Math.floor(targetFolds))
+  const trainBars = Math.max(WF_MIN_TRAIN_BARS, Math.floor(bars / 3))
+  const testBars = Math.max(WF_MIN_TEST_BARS, Math.floor((bars - trainBars) / folds))
+  return { trainBars, testBars }
+}
+
 export interface WFConfig {
   trainBars: number
   testBars: number

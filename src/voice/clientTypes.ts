@@ -229,3 +229,121 @@ export interface TtsEngineView {
   /** 音色 id → 走哪条引擎。面板与合成器**都读它**，不允许各自再推导一遍。 */
   engineOf: Record<string, VoiceEngineKind>
 }
+
+// ── 对话记录视图（`GET /voice/transcript`，Task #114）──
+//
+// ★ 这套类型是服务端 `server/voice/transcript.ts` 落盘格式的**投影**，
+//   不是另一份真相。字段名与服务端逐字一致，是因为面板要显示的就是
+//   落盘文件里那一行 —— 中间任何一次"顺手改名/换算"都会让
+//   "界面上看到的"与"文件里写着的"变成两件事。
+
+export interface TranscriptAttachmentView {
+  name: string
+  mimeType: string
+  bytes: number
+}
+
+export interface TranscriptLineView {
+  at: number
+  sid: string
+  turnId: number
+  role: 'user' | 'assistant'
+  text: string
+  /** 正文被截断了（我们主动截的，原长在 `textBytes`）。 */
+  truncated?: boolean
+  textBytes?: number
+  intent?: string
+  gen?: number
+  /** 仅 assistant：这条答复有没有真的被念出来。 */
+  dropped?: boolean
+  /** 仅 assistant：作废原因。`generation`=用户插话（正常），`turn`=轮次翻篇（异常信号）。 */
+  dropReason?: 'generation' | 'turn'
+  /** 仅 user：当时贴了什么。 */
+  attachments?: TranscriptAttachmentView[]
+}
+
+export interface TranscriptTurnView {
+  sid: string
+  turnId: number
+  at: number
+  /**
+   * 三态**互不顶替**：
+   *   `answered`   问了，也答了
+   *   `unanswered` 问了，没等到答复（在途 / 崩溃 / 进程被重启）
+   *   `orphan`     只有答复没有提问（写入被腰斩；出现即说明有问题）
+   */
+  state: 'answered' | 'unanswered' | 'orphan'
+  user: TranscriptLineView | null
+  assistant: TranscriptLineView | null
+  /**
+   * 意图的中文标签，**由服务端给**（`intents.ts` 的 `INTENT_LABEL`）。
+   * `null` = 这一轮没解析出意图。前端刻意不维护第二份标签表。
+   */
+  intentLabel: string | null
+}
+
+export interface VoiceTranscriptView {
+  turns: TranscriptTurnView[]
+  /** `null` = **真的读到了**（哪怕 0 条）。有值 = 读不到，这就是原因。 */
+  unreadable: string | null
+  /** 解析失败的行数。> 0 必须在界面上说出来。 */
+  badLines: number
+  badReasons: string[]
+  /** 还有更早的记录没取（可翻页）。 */
+  more: boolean
+  /** 本次扫了哪些日文件。 */
+  files: string[]
+  /** 落盘侧最近一次失败。`null` = 迄今没失败过。 */
+  writeFailure: { at: number; reason: string } | null
+  /** 当前进程的会话 id —— 面板用它标出"哪几轮是这次开机聊的"。 */
+  sessionId: string
+  /** 记录落在哪个目录（给人核对"去哪找文件"）。 */
+  root: string
+}
+
+/**
+ * 手机端远程指挥通道（Telegram）的状态视图。
+ *
+ * ★ 与 `server/voice/telegram.ts` 的 `TelegramView` **逐字段对应**。
+ *   这一份是前端契约（不能 import 服务端类型），所以它必须被
+ *   "字段有没有漏"这件事钉住：面板少显示一格，用户就少一个判断依据，
+ *   而不会报错。四组容易漏而且都很要紧的：
+ *     · `pending`     —— 待放行的会话（用户唯一能自己完成开通的入口）
+ *     · `allowedIds`  —— 名单里的具体 id（收回操作需要一个能点名的对象）
+ *     · `polling`/`configured` —— "在不在跑"与"配没配"
+ *     · `chatListError` —— 白名单文件坏了（四种坏法里唯一一种要去修文件的）
+ */
+export interface TelegramPendingChatView {
+  chatId: string
+  /** 对方的显示名（可能为空 —— 有人没设用户名）。 */
+  name: string
+  at: number
+  /** 敲了几次门。> 1 说明他是真想连上，不是误发。 */
+  tries: number
+}
+
+export interface TelegramView {
+  configured: boolean
+  /** 白名单**条数**。0 = 谁都不放行（fail-closed）。 */
+  allowedChats: number
+  /** 白名单里的**具体 id**（与上面那条是两个口径：一个计数、一个清单）。 */
+  allowedIds: string[]
+  polling: boolean
+  /** 当前轮询器的代号。变了说明上一个已经作废（两个循环会重复处理消息）。 */
+  loopId: number
+  polls: number
+  failures: number
+  handled: number
+  rejected: number
+  lastPollAt: number | null
+  lastHandledAt: number | null
+  lastError: string | null
+  /** 待放行的会话 —— 已放行的会被剔掉。 */
+  pending: TelegramPendingChatView[]
+  /** 一段**可直接显示**的人话（服务端给的，前端不自己拼）。 */
+  speech: string
+  /** 白名单文件读不出来的原因。`null` = 正常。 */
+  chatListError: string | null
+  /** 白名单文件路径（用户要能知道"它究竟把名单存哪了"）。 */
+  chatFile: string
+}

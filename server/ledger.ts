@@ -1,4 +1,4 @@
-﻿import { initPersistence, isPersistent, persistEvent, getDb, loadLastChainRow } from './persistence.ts'
+﻿import { initPersistence, isPersistent, persistEvent, getDb, loadLastChainRow, withDbLockRetry } from './persistence.ts'
 import type { DatabaseSync } from 'node:sqlite'
 import { computeEventHash, GENESIS_HASH } from './audit.ts'
 
@@ -44,20 +44,33 @@ export function appendEvent(kind: string, payload: Record<string, unknown>): Mem
   if (dbh) {
     // 事件行 + 链哈希必须原子落盘：历史上链哈希静默丢失正是持久链断裂的另一诱因
     try {
-      dbh.exec('BEGIN IMMEDIATE')
-      const dbSeq = persistEvent(ev.ts, ev.kind, payloadJson)
-      ev.seq = dbSeq
-      seq = Math.max(seq, dbSeq)
-      // 哈希在最终 seq 确定后计算，保证内存链与持久链对同一事件得出相同 hash
-      ev.hash = computeEventHash(prevHash, ev.seq, ev.ts, ev.kind, payloadJson)
-      dbh.prepare('INSERT OR REPLACE INTO audit_chain (seq, hash) VALUES (?, ?)').run(ev.seq, ev.hash)
-      dbh.exec('COMMIT')
+      // ★ 2026-09-23：锁争用先**有界重试**，再谈失败。
+      //   改之前这里一遇到 `database is locked` 就直接走 catch —— 那一段会
+      //   `seq += 1` 然后把事件**只留在内存里**，账本上悄悄地少一条。
+      //   账本少一条的后果是审计链从那一行起对不上，而且没有任何提示。
+      //   `BEGIN IMMEDIATE` 是立刻取写锁，重试时它必须从 BEGIN 整体重放，
+      //   所以整段（BEGIN → 写 → COMMIT）都放进 `withDbLockRetry` 的回调里。
+      withDbLockRetry('appendEvent', () => {
+        dbh.exec('BEGIN IMMEDIATE')
+        try {
+          const dbSeq = persistEvent(ev.ts, ev.kind, payloadJson)
+          ev.seq = dbSeq
+          seq = Math.max(seq, dbSeq)
+          // 哈希在最终 seq 确定后计算，保证内存链与持久链对同一事件得出相同 hash
+          ev.hash = computeEventHash(prevHash, ev.seq, ev.ts, ev.kind, payloadJson)
+          dbh.prepare('INSERT OR REPLACE INTO audit_chain (seq, hash) VALUES (?, ?)').run(ev.seq, ev.hash)
+          dbh.exec('COMMIT')
+        } catch (e) {
+          try {
+            dbh.exec('ROLLBACK')
+          } catch {
+            /* 已经回滚过 */
+          }
+          // 原样抛出：由 `withDbLockRetry` 判"这是锁争用（可重试）"还是"这是真错"。
+          throw e
+        }
+      })
     } catch (e) {
-      try {
-        dbh.exec('ROLLBACK')
-      } catch {
-        /* ignore */
-      }
       console.error(`[audit] 事件持久化失败 seq~${ev.seq} kind=${kind}: ${e instanceof Error ? e.message : e}`)
       seq += 1
       ev.seq = seq
@@ -94,7 +107,14 @@ export function eventCount(): number {
   return events.length
 }
 
-/** 鍐呭瓨閾惧畬鏁存€ф牎楠岋細浠庡垱涓栧搱甯岄噸鏀惧叏閮ㄤ簨浠?*/
+/**
+ * 内存链完整性校验：从创世哈希起重放全部事件，逐条比对 seq 与 hash。
+ *
+ * ★ 2026-09-23：这行注释此前是乱码（`鍐呭瓨閾惧畬鏁存€?…`）—— 它是 UTF-8 字节被
+ *   按 GBK 读过一遍的产物，也就是说这个文件曾在某条**编码不对的路径**上被写过。
+ *   乱码本身不影响运行，但它说明"文件被写坏过"，而写坏这文件的那条路径
+ *   同样可能写坏别的东西。已按上下文复原为原意。
+ */
 export function verifyMemoryChain(): { ok: boolean; checked: number; brokenAtSeq: number | null; scope: string } {
   let prev = memBaselinePrev
   for (const e of events) {

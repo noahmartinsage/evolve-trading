@@ -15,10 +15,11 @@
  * 用法：npm run test:pet
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 
 import {
   alwaysOnTopArgs,
@@ -621,10 +622,24 @@ section('P10 主进程结构不变量：这两条都是"跑起来看着不对"�
   //    所以做成语法门而不是靠记性：用 node --check 真解析一遍。
   const mjsFiles = readdirSync(join(ROOT, 'desktop')).filter((f) => f.endsWith('.mjs'))
   const badParse: string[] = []
+  const unverified: string[] = []
+  // ★★ 用**异步** `execFile`，不用 `execFileSync`（2026-09-22 修）。
+  //   本机实测（`.trash/<ts>/_diag_spawn.cjs`）：agent 环境注入的 node shim 下，
+  //   `spawnSync`/`execSync`/`execFileSync` **恒 EBUSY**，而异步的 `spawn`/`exec` 正常。
+  //   用同步版本 ⇒ "环境不许起进程"会被报成"preload.mjs 里写了 TS 注解"，
+  //   两者指向**相反**的动作（判据 C5），而误报会训练人忽略这道门（判据 A1）。
+  const execFileAsync = promisify(execFile)
   for (const f of mjsFiles) {
     try {
-      execFileSync(process.execPath, ['--check', join(ROOT, 'desktop', f)], { stdio: 'pipe' })
+      await execFileAsync(process.execPath, ['--check', join(ROOT, 'desktop', f)])
     } catch (e) {
+      // 事因必须分开（判据 C5）：spawn 失败 ⇒ `code` 是**字符串**（EBUSY/ENOENT…）；
+      // `node --check` 真失败 ⇒ `code` 是**数字**（退出码），stderr 里有 SyntaxError。
+      const code = (e as NodeJS.ErrnoException | undefined)?.code
+      if (typeof code === 'string') {
+        unverified.push(`${f}（起不来进程：${code}）`)
+        continue
+      }
       const msg = e instanceof Error ? e.message.split('\n').slice(0, 2).join(' ') : String(e)
       badParse.push(`${f}（${msg.slice(0, 90)}）`)
     }
@@ -635,6 +650,16 @@ section('P10 主进程结构不变量：这两条都是"跑起来看着不对"�
     badParse.length > 0
       ? `类型擦除只作用于 .ts —— ${badParse.join('；')}`
       : `${mjsFiles.join(' / ')} 全部通过 node --check（预加载脚本不过类型擦除，写了注解就会在第一行 SyntaxError）`,
+  )
+  // ★ 配对断言（判据 A3：假绿）：上面那条的通路是"解析过 ⇒ 绿"。
+  //   若进程根本起不来，`badParse` 会是空的 —— 于是它**照样绿**，
+  //   而实际上一个字节都没验。所以"没跑成"必须自己说出来，不许冒充通过。
+  check(
+    'P10 ②b 每一条 .mjs 都真的解析过（没有"起不来"冒充"通过"）',
+    unverified.length === 0,
+    unverified.length > 0
+      ? `以下文件**没有真的验证**（进程起不来，≠ 语法通过）：${unverified.join('；')}`
+      : `${mjsFiles.length} 条全部真的解析过`,
   )
 
   // ③ 主进程与启动器必须是 .ts（带注解），预加载必须是 .mjs（纯 JS）。

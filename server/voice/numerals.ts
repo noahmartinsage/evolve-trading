@@ -152,6 +152,13 @@ function unitBasis(segment: string): 'notional' | 'qty' | 'unknown' {
  *
  * 抽取顺序刻意是「先找带单位的长片段，再找裸数字」：
  * 因为裸数字单独出现时语义最含糊，必须让更明确的形式优先命中。
+ *
+ * ⚠️ 调用方注意：**这句话里可能同时有好几个数**（杠杆、止盈、止损、金额）。
+ *   本函数只认「数字 + 单位」这一种强形式，裸数字它是**从左往右取第一个** ——
+ *   所以调用方必须先把不属于金额的那几段**遮掉**（见 `contract.ts` 的
+ *   `maskContractFigures`），否则「开 125 倍合约做多 BTC」会把 125 当成金额。
+ *   实测踩过：`开 125 倍合约做多 BTC 10U` 在修好大小写之前，
+ *   拿到的金额是 **125**（杠杆那个数），名义额因此被算成 15625 而不是 1250。
  */
 export function extractAmount(text: string): AmountParse | null {
   const s = text.trim()
@@ -168,13 +175,18 @@ export function extractAmount(text: string): AmountParse | null {
 
   // ② 带"万/亿"或带货币/件数量词的片段
   //    数字部分允许汉字或阿拉伯
+  //
+  // ★ 必须带 `i` 标志。单位表里全是小写 ASCII（`u` / `usdt` / `btc` / `eth`），
+  //   而用户打字时「10U」「0.5ETH」几乎全是**大写**。
+  //   不加 `i` 的后果实测过：`10U` 匹配不上 ⇒ 落到下面的裸数字分支 ⇒
+  //   把杠杆那个数 125 当成了金额。**金额错成杠杆数**，而它照样是一笔合法单。
   const numPat = '(\\d+(?:\\.\\d+)?|[零〇一幺二两三四五六七八九十百千万亿]+)'
   const unitPat = [...NOTIONAL_UNITS, ...QTY_UNITS].join('|')
-  const withUnit = new RegExp(`${numPat}\\s*(${unitPat})`).exec(s)
+  const withUnit = new RegExp(`${numPat}\\s*(${unitPat})`, 'i').exec(s)
   if (withUnit) {
     const v = parseChineseNumber(withUnit[1])
     if (v !== null) {
-      const basis = unitBasis(withUnit[2])
+      const basis = unitBasis(withUnit[2].toLowerCase())
       return { value: v, matched: withUnit[0], basis }
     }
   }

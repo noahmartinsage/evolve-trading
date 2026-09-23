@@ -9,12 +9,25 @@ import {
   resetOrch,
   seedPrice,
 } from '../server/core.ts'
-import { eventCount, getEvents, resetLedger } from '../server/ledger.ts'
+import { eventCount, getEvents, resetLedger, initLedger } from '../server/ledger.ts'
 import { liveGateway } from '../server/gateway/executor.ts'
 import { pipelineService } from '../server/pipelineService.ts'
 import { receipt } from './overfit-fixture.ts'
 import { SandboxAdapter } from '../server/venue/sandbox.ts'
+import { __resetIntentLedgerForTest } from '../server/intentLedger.ts'
+import { isPersistent } from '../server/persistence.ts'
+import { join } from 'node:path'
 import type { Candle } from '../src/engine/index.ts'
+
+// ★★ 隔离必须先于任何 `init*()`（判据 C10）。本烟测会走**真实的 live 出网链路**
+//   （`processLiveIntent` → 网关 → 台账），所以它需要一个属于自己的库：
+//     ① 不污染用户正在运行的应用的真库（`data/orch.db`）；
+//     ② 不被上一次运行留下的 `in_flight` 行挡住 —— 幂等台账一旦记下
+//        `live-ok` 这个语义键，**下次再跑同一个键就会被正确地拦住**，
+//        于是 `live-ok` 那条断言会报"合法单失败"，**红在了"幂等生效"这件事上**。
+//        ★ 这是纯粹的环境假红（判据 A1），不是代码缺陷 —— 所以修隔离，不改断言。
+//   ★ 命名带 pid + 时间戳：天然是新文件，清理失败也不会让门禁变红。
+process.env.ORCH_DB = join('data', `orch-smoke-${process.pid}-${Date.now()}.db`)
 
 function fail(msg: string): never {
   console.error(`❌ ORCH SMOKE FAIL · ${msg}`)
@@ -24,6 +37,16 @@ function fail(msg: string): never {
 function bar(t: number, o: number, c: number): Candle {
   return { t, o, h: Math.max(o, c) * 1.001, l: Math.min(o, c) * 0.999, c, v: 10_000 }
 }
+
+// ★★ 必须显式 `initLedger()`：出网幂等已改为**持久化**语义键台账
+//   （`server/intentLedger.ts`），而台账在 `getDb() === null` 时**刻意 fail-closed**
+//   （判据 C10：没有台账就没法保证"同一笔只出网一次"，此时放行是假象）。
+//   ★ 忘了这一步的症状极具误导性：**第一笔 live 单**就被判"重复"，
+//     报文写的是 `INTENT_IN_FLIGHT_RECONCILE_REQUIRED`（"结果未知，去对账"）——
+//     而真因是"库根本没打开"。两者都表现为"下单失败"，却指向**完全相反的动作**
+//     （一个是去对账、一个是去补 init）。所以下面紧跟一条前置断言把它分开。
+initLedger()
+if (!isPersistent()) fail(`持久层未就绪（ORCH_DB=${process.env.ORCH_DB}）⇒ 无法区分"幂等生效"与"根本没台账"`)
 
 resetLedger()
 resetOrch(100_000)
@@ -98,6 +121,10 @@ if (!seqMonotonic) fail('账本 seq 非单调递增')
 console.log(`✅ 账本追加写 · 共 ${eventCount()} 条事件 · seq 单调`)
 
 liveGateway.reset()
+// ★ 意图台账也要清 —— 但走**专门的测试钩子**，不是 `liveGateway.reset()`。
+//   理由见 `executor.ts` 的 `reset()` 注释：台账记录的是"哪些意图已经出过网"这个
+//   **历史事实**，reset 掉它等于给调用方一条绕过幂等的后门。烟测要清，只能显式调它。
+__resetIntentLedgerForTest()
 seedPrice('LT', 50)
 
 // 晋升内禁：无策略身份 / 未知策略 一律拒绝（授权闸在握手之前，纯内存检查 fail-fast）

@@ -12,6 +12,7 @@ import {
   type MissionStatusView,
   type StartConsentView,
 } from '../orch/client.ts'
+import { MISSION_EXAMPLES } from './missionExamples.ts'
 
 // ───────────────────────────── 文案表 ─────────────────────────────
 // 全部集中在这里，为的是「同一件事只有一种说法」：
@@ -67,12 +68,10 @@ const EXEC_WORD: Record<string, string> = {
   live: '真实资金',
 }
 
-/** 三个示例刻意各指向一条支路 —— 用户第一次进来就能把三态看全。 */
-const EXAMPLES = [
-  '用10U在OKX测试网做到100U，1天内，可以用高倍合约杠杆',
-  '用2000U在沙盒做到2200U，7天内',
-  '在OKX测试网做BTC永续，3天内翻倍',
-]
+// 三个例句住在 `missionExamples.ts` —— 因为 `mission-smoke` 的 S-M3b 会真的
+// 把它们喂进裁定器，断言仍然**三态互不相同**。留在本文件里就没法被门禁读到，
+// 题面与判据一旦分岔（改上限 / 换场所 / 调阈值）也不会有人报红。
+// 每一句各自落在哪条支路上，以及原来的三句为什么**全都**落"做不成"，都写在那个文件里。
 
 /** 服务端用 4xx 表达"这句话我判不了"时的说法。**不是连通故障**，所以不能混为一谈。 */
 const PLAN_ERROR_WORD: Record<string, string> = {
@@ -624,7 +623,7 @@ export default function MissionPage() {
           />
           <div className="mp-examples">
             <span className="mp-examples-l">试试其中一句：</span>
-            {EXAMPLES.map((ex) => (
+            {MISSION_EXAMPLES.map((ex) => (
               <button
                 key={ex}
                 className="mp-example"

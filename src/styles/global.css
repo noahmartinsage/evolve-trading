@@ -206,3 +206,55 @@ html, body, #root {
   100% { opacity: 1; box-shadow: 0 0 4px currentColor; }
 }
 .pulse-dot2.live { animation: pulseGlow 1.8s infinite; }
+
+/* ── 命令面板（⌘K / Ctrl+K）─────────────────────────────────────────
+ * 上游 OpenTerminal 的招牌交互。形态照学：遮罩 + 输入框 + 键盘导航。
+ * 配色一律走 tokens，不写死 —— 否则换主题时这里会变成一个孤岛。
+ */
+.cmdk-mask {
+  position: fixed; inset: 0; z-index: 900;
+  background: rgba(4,5,10,0.72);
+  backdrop-filter: blur(3px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 14vh;
+}
+.cmdk {
+  width: min(620px, 92vw);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+  overflow: hidden;
+}
+.cmdk-input {
+  width: 100%; box-sizing: border-box;
+  padding: 14px 16px;
+  background: transparent; border: 0; outline: none;
+  color: var(--text-main);
+  font-family: var(--font-mono); font-size: 13px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.cmdk-input::placeholder { color: var(--text-dim); }
+.cmdk-list { max-height: 46vh; overflow-y: auto; padding: 6px 0; }
+.cmdk-item {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 9px 16px; cursor: pointer;
+}
+.cmdk-item.on { background: rgba(232,121,249,0.10); }
+.cmdk-label { font-family: var(--font-mono); font-size: 12px; color: var(--text-main); }
+.cmdk-hint { font-size: 11px; color: var(--text-dim); }
+.cmdk-empty { padding: 18px 16px; font-size: 12px; color: var(--text-sub); line-height: 1.7; }
+.cmdk-foot {
+  padding: 8px 16px; border-top: 1px solid var(--border-strong);
+  font-size: 10px; color: var(--text-dim);
+}
+
+/* ── 报价闪烁 ────────────────────────────────────────────────────────
+ * 涨红跌绿（本地区惯例，见 regional_conventions）。
+ * 用 background 而不是 color：数字本身已经有颜色（它表示涨跌），
+ * 闪一下底色只表示"这一格刚刚变了"，两件事不该用同一个通道表达。
+ */
+@keyframes quoteFlashUp   { 0% { background: rgba(255,77,109,0.22); } 100% { background: transparent; } }
+@keyframes quoteFlashDown { 0% { background: rgba(0,214,143,0.22); }  100% { background: transparent; } }
+.qflash-up   { animation: quoteFlashUp 450ms ease-out; border-radius: 3px; }
+.qflash-down { animation: quoteFlashDown 450ms ease-out; border-radius: 3px; }

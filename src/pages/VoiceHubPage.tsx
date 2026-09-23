@@ -116,6 +116,20 @@ export default function VoiceHubPage({ standalone = false }: { standalone?: bool
     return () => window.clearInterval(t)
   }, [])
 
+  /**
+   * 进页面就把历史对话载进来。
+   *
+   * ★ 为什么要自动而不是等用户点：一个显示着「未载入」的空面板，与
+   *   一个**真的没有记录**的面板，在用户眼里长得一模一样。让他先点一次
+   *   按钮才肯说实话，等于把「沉默」当默认值。
+   * ★ 依赖只写 `loadTranscript`（`useCallback` 稳定）：写 `voice` 的话
+   *   每渲染一次就会重新拉一次，等于给服务端加了个轮询。
+   */
+  const { loadTranscript } = voice
+  React.useEffect(() => {
+    void loadTranscript()
+  }, [loadTranscript])
+
   // ── 心情：优先级从"最需要立刻让人看见"往下排 ──
   const mood: PetMood = useMemo(() => {
     if (voice.recentAlarm) return 'alarm'
@@ -1104,6 +1118,116 @@ export default function VoiceHubPage({ standalone = false }: { standalone?: bool
               每条播报都带账本序号 —— 「秘书不会自己编状态」这件事因此可核，而不是只能相信。
             </div>
           </div>
+
+          {/*
+            对话记录（Task #114）。
+
+            与上面「播报日志」的分工，是这张卡存在的全部理由：
+              · 播报日志 = **系统主动说的**（报警 / 状态 / 日报），内存态，刷新就没；
+              · 对话记录 = **你和它之间说的话**，落盘的，重启、刷新都在。
+            合并成一张卡的话，"我刚才到底说了什么"这个问题会被淹没在
+            几百条播报里。
+          */}
+          <div className="card">
+            <div className="v-card-title">
+              对话记录
+              <span className="v-note">
+                {voice.transcript
+                  ? voice.transcript.turns.length > 0
+                    ? `最近 ${voice.transcript.turns.length} 轮`
+                    : '空'
+                  : '未载入'}
+              </span>
+              <button className="v-btn small" onClick={() => void voice.loadTranscript()}>
+                {voice.transcript ? '刷新' : '载入'}
+              </button>
+            </div>
+
+            {/*
+              五件**不同**的事各说各的（判据 24 / 25）。把任何一个归并进
+              "还没有聊过"，用户就会照着一个假事实行事：
+               读不到 / 目录读不了 / 有行坏了 / 写不进去 / 真的没聊过
+            */}
+            {voice.transcriptError && (
+              <div className="v-warnline">读不到对话记录：{voice.transcriptError}</div>
+            )}
+            {voice.transcript?.unreadable && (
+              <div className="v-warnline">记录目录读不了：{voice.transcript.unreadable}</div>
+            )}
+            {voice.transcript && voice.transcript.badLines > 0 && (
+              <div className="v-warnline">
+                有 {voice.transcript.badLines} 行读坏了（{voice.transcript.badReasons[0] ?? '原因未记'}）——
+                下面是读到的部分，不是全部。
+              </div>
+            )}
+            {voice.transcript?.writeFailure && (
+              <div className="v-warnline">
+                记录写不进去：{voice.transcript.writeFailure.reason} ——
+                刚聊的话没有落盘，关掉页面就找不回来了。
+              </div>
+            )}
+
+            {voice.transcript && !voice.transcript.unreadable && voice.transcript.turns.length === 0 && (
+              <div className="v-dim">还没有聊过。你对着桌宠说的每一句都会记在这里，刷新和重启都还在。</div>
+            )}
+
+            <div className="v-log">
+              {voice.transcript?.turns.map((t) => (
+                <div key={`${t.sid}#${t.turnId}`} className="v-turn">
+                  <div className="v-log-top">
+                    <span className="v-time mono">{hhmmss(t.at)}</span>
+                    {t.intentLabel && <span className="v-cat">{t.intentLabel}</span>}
+                    {voice.transcript && t.sid === voice.transcript.sessionId && (
+                      <span className="v-badge">本次开机</span>
+                    )}
+                    <span className="v-flex1" />
+                    {t.state === 'unanswered' && <span className="v-badge warn">没等到答复</span>}
+                    {t.state === 'orphan' && <span className="v-badge warn">缺提问</span>}
+                    {t.assistant?.dropped && (
+                      <span className="v-badge warn" title="这句话生成了，但你插话把它作废了 —— 一个字都没念出去">
+                        被打断·没念
+                      </span>
+                    )}
+                  </div>
+                  {t.user && (
+                    <div className="v-bubble user">
+                      我：{t.user.text || '（只有附件）'}
+                      {t.user.attachments && t.user.attachments.length > 0
+                        ? `［附件：${t.user.attachments.map((a) => a.name).join('、')}］`
+                        : ''}
+                      {t.user.truncated ? ` …（原文 ${t.user.textBytes} 字节，已截断）` : ''}
+                    </div>
+                  )}
+                  {t.assistant && (
+                    <div className="v-reply">
+                      桌宠：{t.assistant.text}
+                      {t.assistant.truncated ? ` …（原文 ${t.assistant.textBytes} 字节，已截断）` : ''}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="v-turn-foot">
+              {voice.transcript?.more && (
+                <button className="v-btn small" onClick={() => void voice.loadTranscript({ more: true })}>
+                  更早的记录
+                </button>
+              )}
+              {voice.transcript && voice.transcript.files.length > 0 && (
+                <span className="v-note mono" title={`记录目录：${voice.transcript.root}`}>
+                  {voice.transcript.files.join(' · ')}
+                </span>
+              )}
+            </div>
+
+            <div className="v-foot">
+              按天写进 data/voice 目录，只追加：没有改写、没有删除接口 ——
+              想清掉某一天的，你自己删那个文件。标着「被打断·没念」的轮次是：
+              话已经生成了，但你插话把它作废了，所以它在这里、却没进过你的耳朵 ——
+              这两件事必须分开记，否则你会以为系统答过了。
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1161,6 +1285,20 @@ export default function VoiceHubPage({ standalone = false }: { standalone?: bool
         .v-btn:hover:not(:disabled) { color: var(--text-main); border-color: var(--primary); }
         .v-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .v-btn.primary { background: var(--primary-10); border-color: var(--primary-40); color: var(--primary); font-weight: 600; }
+        .v-btn.small { height: 22px; padding: 0 8px; font-size: 10px; }
+
+        /* ── 对话记录（Task #114）──
+           视觉上刻意与「播报日志」同族：它俩都是"发生过什么"的列表，
+           区别只在主动播报 vs 双向对话。 */
+        .v-turn { padding: 8px 0; border-bottom: 1px dashed var(--border); }
+        .v-turn:last-child { border-bottom: none; }
+        .v-turn .v-reply { margin-top: 6px; font-size: 12px; }
+        .v-warnline {
+          margin: 6px 0; padding: 7px 10px; border-radius: 7px;
+          background: rgba(255,176,32,0.08); border: 1px solid rgba(255,176,32,0.35);
+          font-family: var(--font-ui); font-size: 11px; color: var(--warning); line-height: 1.6;
+        }
+        .v-turn-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 
         .v-interim {
           margin-top: 10px; min-height: 42px; padding: 10px 12px;

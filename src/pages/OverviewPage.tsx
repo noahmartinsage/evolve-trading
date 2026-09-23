@@ -119,11 +119,11 @@ export default function OverviewPage() {
           </div>
           <div className="ap-actions">
             {ap?.running ? (
-              <button className="btn btn-sell btn-lg full" onClick={apStop}>🛑 停止自治循环</button>
+              <button className="btn btn-sell btn-lg full" data-ui="overview.autopilot.stop" onClick={apStop}>🛑 停止自治循环</button>
             ) : (
-              <button className="btn btn-buy btn-lg full" onClick={apStart}>▶️ 一键启动自治循环</button>
+              <button className="btn btn-buy btn-lg full" data-ui="overview.autopilot.start" onClick={apStart}>▶️ 一键启动自治循环</button>
             )}
-            <button className="btn full" onClick={() => setPage('evo')}>🧬 查看因子挖掘详情</button>
+            <button className="btn full" data-ui="overview.factors.detail" onClick={() => setPage('evo')}>🧬 查看因子挖掘详情</button>
           </div>
         </div>
         <div className="ap-note">全自动闭环：因子挖掘（真实回测网格）→ 门禁评估 → 纸交易执行 → 盈利目标追踪 → 达标自动止盈 / -10% 回撤保护。仅纸交易面；实盘需晋升门禁+人工审批。</div>

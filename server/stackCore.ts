@@ -30,6 +30,9 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 
+import { HEALTH_ROLE_FIELD, healthRoleOf, isServiceRole, type ServiceRole } from './serviceIdentity.ts'
+import { INSECURE_DEFAULT_TOKEN } from './orchAuth.ts'
+
 export interface StackRole {
   name: string
   command: string
@@ -176,8 +179,16 @@ export interface StackHandle {
 /** 默认端口。★ 编排层必须是 8790：前端 `Store.tsx` 的默认连接地址就是它。 */
 export const DEFAULT_PORTS = { ledger: 8791, orch: 8790, web: 4173 } as const
 
-/** 本地默认令牌。**不用于生产**（生产走机密管理，见 loadEnv.ts 顶部）。 */
-export const DEV_TOKEN = 'dev-insecure-token'
+/**
+ * 本地默认令牌。**不用于生产**（生产走机密管理，见 loadEnv.ts 顶部）。
+ *
+ * ★★ 值本身住在 `server/orchAuth.ts`（那里才是判据的家）。
+ *   这里原来又写了一遍字面量 —— 于是"默认令牌"在仓库里有四个主人，
+ *   而这次给它加回环限制时就正好踩到了：改了三个地方、漏了第四个，
+ *   症状是"启动了但连不上"，看起来像网络问题。
+ *   现在它只是个别名，`npm run test:authz` 会盯着"server/** 里这个字面量只许出现一次"。
+ */
+export const DEV_TOKEN = INSECURE_DEFAULT_TOKEN
 
 function killTree(proc: ChildProcess): void {
   const pid = proc.pid
@@ -251,7 +262,12 @@ export function createStack(opts: {
           uptimeMs: now - entry.startedMs,
           lastLine: last?.text ?? '',
           lastLineAt: last ? stampLocal(new Date(last.at)) : null,
-          silentForMs: last ? now - last.at : null,
+          // ★ 钳到 ≥0：stdout 管道可能**比 exit 事件晚**被读到 —— 父进程自己的
+          //   事件循环被判给 taskkill 的同步调用挡住时尤其明显。此时
+          //   `last.at > now`，差值为负。负数对"距最后一次说话过了多久"
+          //   没有含义：它不是"提前说了话"，只是父进程读到它的时刻晚于
+          //   它观测到退出的时刻。实测形态见 smoke 的 S-K3。
+          silentForMs: last ? Math.max(0, now - last.at) : null,
           tail: entry.tail.map((x) => stampLocal(new Date(x.at)) + ' ' + x.text),
           crashLogDeclared: probe.declared,
           crashLogPath: probe.path,
@@ -290,18 +306,160 @@ export function createStack(opts: {
 }
 
 /**
+ * 本机的**全部**回环写法。**必须都试。**
+ *
+ * ★ `127.0.0.1` 与 `[::1]` 在 Windows 上是两条独立的路：同一个端口可以被两个
+ *   不同进程分别占住。只试一条，就等于把"另一个进程"误当成"服务没起来"
+ *   （或反过来，误当成"服务好了"）。两种误判都会把排查引向错误的方向。
+ *   实证与"为什么必须问『你是谁』"见 `serviceIdentity.ts`。
+ */
+export const LOOPBACK_HOSTS = ['127.0.0.1', '[::1]'] as const
+
+export interface LoopbackTry {
+  url: string
+  /** 人话结论。失败时**必须**能从这个字段看出下一步该查什么。 */
+  verdict: string
+  ours: boolean
+  /**
+   * 有东西应答了吗（HTTP 层面收到了响应）。
+   * ★ 与 `ours` **分开**：`answered && !ours` = 「有别人的进程占着这个端口」，
+   *   而 `!answered` = 「这条路没人」。两者要做的事完全不同（查占端口 vs 查服务为什么不起来）。
+   */
+  answered: boolean
+  body?: unknown
+}
+
+export interface LoopbackResolution {
+  /** 真的是我们的那个 base（`http://<host>:<port>`）。全都没认出来时是 `null`。 */
+  base: string | null
+  body: unknown
+  /** 逐个地址的判定。**`base === null` 时它是唯一能看的东西**，所以永远都返回。 */
+  tries: LoopbackTry[]
+}
+
+/**
+ * 在**所有回环写法**上找一个「真的是我们的」服务。
+ *
+ * ★ 不认识的一律算「有人但不是我们」——**不许当成"没有服务"**。
+ *   这两件事指向相反的动作：前者要去查是谁占了端口，后者才是"服务挂了"。
+ *   判据 13 的同一条：分得清"能力没有"和"名字烂了"。
+ */
+export async function resolveLoopbackService(
+  port: number,
+  path: string,
+  role: ServiceRole,
+  perTryMs = 2000,
+): Promise<LoopbackResolution> {
+  const tries: LoopbackTry[] = []
+  let found: { base: string; body: unknown } | null = null
+  // ★ **不许找到就返回**：两个地址都要看一眼。
+  //   因为"另一条路上坐着别人的服务"本身就是一条要报出来的隐患 ——
+  //   它不是本次启动的问题，而是**下一个**去连 `127.0.0.1` 的工具的坑，
+  //   而那时表现是"端点 404 / 数据是别人的"，与今天的现象毫无相似之处。
+  for (const host of LOOPBACK_HOSTS) {
+    const url = `http://${host}:${port}${path}`
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(perTryMs) })
+      const text = await r.text()
+      let body: unknown = null
+      try {
+        body = JSON.parse(text) as unknown
+      } catch {
+        body = null
+      }
+      const got = healthRoleOf(body)
+      if (r.ok && isServiceRole(body, role)) {
+        tries.push({ url, verdict: '是我们的（自报 ' + HEALTH_ROLE_FIELD + '=' + got + '）', ours: true, answered: true, body })
+        if (found === null) found = { base: `http://${host}:${port}`, body }
+        continue
+      }
+      if (got !== null) {
+        tries.push({
+          url,
+          verdict: '★ 有人，但不是我们 —— 它自报 ' + HEALTH_ROLE_FIELD + '=' + got + '，要查是谁占了这个端口',
+          ours: false,
+          answered: true,
+          body,
+        })
+      } else if (r.status > 0) {
+        tries.push({
+          url,
+          verdict:
+            '★ 有人，但不是我们 —— HTTP ' +
+            String(r.status) +
+            ' 且没有 ' +
+            HEALTH_ROLE_FIELD +
+            ' 声明（多半是**另一个程序**占着这个端口）',
+          ours: false,
+          answered: true,
+          body,
+        })
+      } else {
+        tries.push({ url, verdict: '有人，但不是我们（空响应）', ours: false, answered: true, body })
+      }
+    } catch (e) {
+      tries.push({ url, verdict: '没人应答（' + (e instanceof Error ? e.message : String(e)) + '）', ours: false, answered: false })
+    }
+  }
+  return { base: found?.base ?? null, body: found?.body ?? null, tries }
+}
+
+/**
+ * 反复找，直到找到我们自己的那个地址或超时。返回的是**最后一次**的逐条判定 ——
+ * 超时时它才是唯一能看的东西（"谁在答话"比"超时了"有用得多）。
+ */
+export async function waitForLoopbackService(
+  port: number,
+  path: string,
+  role: ServiceRole,
+  timeoutMs = 25_000,
+  intervalMs = 500,
+): Promise<LoopbackResolution> {
+  const deadline = Date.now() + timeoutMs
+  let last = await resolveLoopbackService(port, path, role)
+  while (last.base === null && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, intervalMs))
+    last = await resolveLoopbackService(port, path, role)
+  }
+  return last
+}
+
+/** 把 `resolveLoopbackService` 的逐条判定渲染成人读的几行。 */
+export function renderLoopbackTries(tries: LoopbackTry[]): string[] {
+  return tries.map((t) => '    · ' + t.url + ' → ' + t.verdict)
+}
+
+/**
  * 轮询等待某个 HTTP 端点可用。
  *
  * ★ 判定用**状态码存在**而不是"返回 200"：`/healthz` 之外的端点会 401，
  *   那也是"服务起来了"的证据。用 200 当判据会让等待永远超时，
  *   而超时的表现是"启动失败"，与真正的原因（判据写窄了）看起来毫无关系。
+ *
+ * ★ 传了 `role` 就**必须**认身份：端口上可能坐着别人的服务（见 `HEALTH_ROLE_FIELD`），
+ *   此时"通了"是假绿。`web`（vite preview）没有身份端点，所以它不传 `role` ——
+ *   这是**唯一**允许不认身份的角色，且原因写在调用点上。
  */
-export async function waitForHealth(url: string, timeoutMs = 25_000, intervalMs = 300): Promise<boolean> {
+export async function waitForHealth(
+  url: string,
+  timeoutMs = 25_000,
+  intervalMs = 300,
+  role?: ServiceRole,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(2000) })
-      if (r.status > 0) return true
+      if (r.status > 0) {
+        if (role === undefined) return true
+        let body: unknown = null
+        try {
+          body = (await r.json()) as unknown
+        } catch {
+          body = null
+        }
+        if (isServiceRole(body, role)) return true
+      }
     } catch {
       /* 还没起来 */
     }
@@ -323,6 +481,18 @@ export interface StackConfig {
    */
   web: 'preview' | 'dev'
   /**
+   * 要不要让**别的设备**（手机）连上这个前端。
+   *
+   * ★ 默认 `false`。`vite preview` 不给 `--host` 时只监听回环，
+   *   于是手机连着同一个 WiFi 也打不开 —— 那正是"默认安全"的那一侧。
+   *
+   * ★★ 打开它必须**同时**有个真令牌，否则等于把出单端点挂到路由器上：
+   *   前端只是壳，真正能下单的是编排层，而编排层本来就在监听所有网卡。
+   *   令牌那一半的判据在 `server/index.ts` 的 `authorized()`（默认令牌只在回环上算数）。
+   *   `scripts/app.ts` 在起服务**之前**就把"远程 + 默认令牌"这一组合拒掉。
+   */
+  remote?: boolean
+  /**
    * 进程级环境覆盖。**它会赢过 `.env`** —— 因为 `loadDotEnv` 只补
    * `process.env` 里**还没有**的键（见 loadEnv.ts）。
    * 本地预览靠这一条把 `.env` 里的 `AUTOPILOT_LIVE=true` 按回 false。
@@ -341,7 +511,17 @@ export function stackRoles(cfg: StackConfig): StackRole[] {
       ? // `--strictPort`：预览端口被占时**直接失败**，不要静默换一个。
         // 桌宠窗口连的是写死的 4173，换端口的结果是"窗口连到别的东西上"，
         // 而它看起来只是"页面没反应"。
-        ['node_modules/vite/bin/vite.js', 'preview', '--port', String(ports.web), '--strictPort']
+        //
+        // `--host` 只在 `remote` 时加：不加的时候 vite 只监听回环，
+        // 手机同一个 WiFi 也打不开 —— 那是默认该有的样子。
+        [
+          'node_modules/vite/bin/vite.js',
+          'preview',
+          '--port',
+          String(ports.web),
+          '--strictPort',
+          ...(cfg.remote ? ['--host'] : []),
+        ]
       : ['node_modules/vite/bin/vite.js']
 
   return [
@@ -382,4 +562,198 @@ export function stackRoles(cfg: StackConfig): StackRole[] {
       env: { ...overrides },
     },
   ]
+}
+
+// ── 启动之后的「运行态」摘要 ─────────────────────────────────────────
+//
+// 为什么要有这一段：**启动器打印的东西必须是它真的读到的东西。**
+// "自循环已常开"「账号池已就绪」这类话如果只是把常量念一遍，那么额度爆掉、
+// 循环被 EV_AUTONOMY 关掉、账号一个都没配的时候，启动器会**照样这么说** ——
+// 用户看到一片绿，而系统其实什么都干不了。所以这三行全部来自刚起来的服务：
+// `/fleet`（通道现状）、`/fleet/autonomy`（循环与下次时刻）、`/fleet/news`（最近读到什么）。
+//
+// ★ 读不到时必须**说读不到**，不许退化成 0：`null` 不是"零个账号"，也不是"没在跑"。
+//   这两件事指向完全相反的动作（去配账号 vs 去启动循环），
+//   而它们的显示形式如果都是"0"，用户没有任何办法分辨（判据 13）。
+
+/** 三个只读探针的原始响应体。`null` = 这一项没读到。 */
+export interface RuntimeProbe {
+  fleet: {
+    pool?: {
+      total?: number
+      ready?: number
+      allExhausted?: boolean
+      speech?: string
+      nextRecoveryAt?: number | null
+      /** 池里每个账号。用于回答"我新加的 key 认到没有"。 */
+      accounts?: { name?: string; exhausted?: boolean }[]
+    }
+  } | null
+  autonomy: {
+    status?: {
+      running?: boolean
+      startCount?: number
+      jobs?: { id: string; label: string; nextAt?: number | null; skippedCount?: number; runCount?: number }[]
+    }
+  } | null
+  news: {
+    latest?: { title?: string; score?: number }[]
+    threshold?: number
+    /** 还没被人裁决的内化提案数。 */
+    pending?: number
+    /** 服务端给的那句话（"读不到提案单"与"没有待办"是两句不同的话）。 */
+    pendingSpeech?: string
+    /** `null` = 读不到榜单；`{ticks: []}` = 空榜。两种必须分开画。 */
+    trending?: { at?: number; ticks?: { ticker: string; weighted: number; mentions: number }[] } | null
+    universe?: { symbols?: string[]; note?: string }
+  } | null
+  /** 没读到的那几项各自的**原因**。读不到的句子必须带上它，否则没法查。 */
+  errors?: Partial<Record<MissKey, string>>
+  /**
+   * 真的读到「我们自己」的那个地址（`null` = 没找到）。
+   * ★ 必须印出来：本机 `127.0.0.1:8790` 与 `[::1]:8790` **可以是两个不同的服务**，
+   *   不写清楚"这几行是从谁的嘴里读的"，出问题时连该查哪条路都不知道。
+   */
+  base?: string | null
+  /** 同一端口上**别人**在答话的地址（已渲染成人话）。下一次别的人还会踩，所以要说出来。 */
+  squatters?: string[]
+}
+
+/**
+ * 「读不到」的条目名。
+ *
+ * ★ 为什么连这个都要显式列出：每一项读不到时的**下一步动作**不同 ——
+ *   自治循环读不到要去看编排日志；提案待办数读不到要去看
+ *   `data/learn/notes.jsonl` 在不在；品种热度读不到要去看
+ *   `data/news/trending.json`。合成一个 `news` 键的话，
+ *   三种不同的下一步会被同一句话糊住。
+ */
+export type MissKey = 'fleet' | 'autonomy' | 'news' | 'news.pending' | 'news.trending'
+
+/** 相对时刻的人话。`null` 与"马上"是两件事，所以这里没有默认值。 */
+function inWords(ms: number): string {
+  if (ms <= 0) return '已到期'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return s + ' 秒后'
+  const m = Math.floor(s / 60)
+  if (m < 60) return m + ' 分后'
+  return Math.floor(m / 60) + ' 小时 ' + String(m % 60).padStart(2, '0') + ' 分后'
+}
+
+function clockOf(ts: number): string {
+  const d = new Date(ts)
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+}
+
+/**
+ * 渲染那三行。**纯函数**：给它一份探针结果，输出几行文字，不碰网络也不碰磁盘 ——
+ * 所以"读不到时会说什么"这件事可以用构造出来的输入断言（`test:stack` S-A1）。
+ */
+export function renderRuntimeSummary(p: RuntimeProbe, now: number = Date.now()): string[] {
+  const miss = (key: MissKey, what: string): string =>
+    '· ' + what + '  ⚠ 读不到（' + (p.errors?.[key] ?? '未知原因') + '）—— 这不等于「没有」，是这一项没读上，别当成正常'
+
+  const lines: string[] = []
+
+  // ⓪ 先说清楚**这几行是从谁的嘴里读的**。
+  //   本机实测：`127.0.0.1:8790` 上坐着的是**别的程序**，我们的编排层在 `[::1]` 那边。
+  //   不写这一行，下面那三行"读不到"就会被读成"服务坏了"，而真正该做的是去查哪个进程占了端口。
+  if (p.base) {
+    lines.push('· 编排层   ' + p.base + '（自报身份已核对：是我们自己的那个）')
+  } else if (p.base === null) {
+    lines.push('· 编排层   ⚠ **两条回环地址上都没有我们的服务** —— 上面的三项读不到是这个原因，不是"没有数据"')
+  }
+  for (const s of p.squatters ?? []) {
+    lines.push('· ⚠ 同一端口的另一条回环地址上是**别人的服务**：' + s + ' ⇒ 谁写死那条地址去连，谁就会连到它上面（读到的数据是别人的，而端点看着"通"）')
+  }
+
+  // ① 自治循环
+  if (p.autonomy === null || !p.autonomy.status) {
+    lines.push(miss('autonomy', '自治循环'))
+  } else {
+    const st = p.autonomy.status
+    const jobs = st.jobs ?? []
+    if (st.running) {
+      // 「下次什么时候」是这一行的重点：用户问"它到底有没有在动"，
+      // 能回答的只有排程时刻，而它不是常量。
+      const upcoming = jobs
+        .filter((j) => typeof j.nextAt === 'number')
+        .sort((a, b) => (a.nextAt as number) - (b.nextAt as number))[0]
+      const next = upcoming
+        ? ' · 最近一项 ' + upcoming.label + ' ' + clockOf(upcoming.nextAt as number) + '（' + inWords((upcoming.nextAt as number) - now) + '）'
+        : ' · 这一轮还没有排程时刻'
+      const skipped = jobs.reduce((s, j) => s + (j.skippedCount ?? 0), 0)
+      lines.push(
+        '· 自治循环  运行中 · ' + jobs.length + ' 项排程' + next + (skipped > 0 ? ' · 累计因额度跳过 ' + skipped + ' 次' : ''),
+      )
+    } else {
+      lines.push('· 自治循环  没在跑（自启动过 ' + (st.startCount ?? 0) + ' 次）→ 要它自己动，在控制台说「一键启动自治循环」')
+    }
+  }
+
+  // ② 账号池（免费模型通道）
+  if (p.fleet === null || !p.fleet.pool) {
+    lines.push(miss('fleet', '模型账号池'))
+  } else {
+    const pool = p.fleet.pool
+    const total = pool.total ?? 0
+    const ready = pool.ready ?? 0
+    // 是不是把用户配的 key 认到了 —— 这一行是**唯一**能回答它的地方：
+    // 池子安静时 `exhausted` 是空的，那既可能是"都好好的"，也可能是"根本没读进来"。
+    const names = (pool.accounts ?? []).map((a) => a.name).filter((n): n is string => typeof n === 'string' && n.length > 0)
+    const who = names.length > 0 ? '（' + names.slice(0, 4).join(' / ') + (names.length > 4 ? ' 等 ' + names.length + ' 个' : '') + '）' : ''
+    if (total === 0) {
+      lines.push('· 模型账号池  一个账号都没配 —— 这是「通道没配」，不是额度用完了（去 .env 的 EV_LLM_ACCOUNTS 加）')
+    } else if (ready > 0) {
+      lines.push('· 模型账号池  ' + total + ' 个账号' + who + '，' + ready + ' 个今天还能用')
+    } else {
+      const when = typeof pool.nextRecoveryAt === 'number' ? clockOf(pool.nextRecoveryAt) + '（' + inWords(pool.nextRecoveryAt - now) + '）' : '明天'
+      lines.push('· 模型账号池  ' + total + ' 个账号' + who + '今天全用完了，' + when + '自动恢复' + (pool.speech ? ' —— ' + pool.speech : ''))
+    }
+  }
+
+  // ③ 新闻雷达
+  const newsJob = p.autonomy?.status?.jobs?.find((j) => j.id === 'news_watch')
+  const newsNext =
+    newsJob && typeof newsJob.nextAt === 'number'
+      ? ' · 下次 ' + clockOf(newsJob.nextAt) + '（' + inWords(newsJob.nextAt - now) + '）'
+      : ' · 下次时刻读不到（自治循环没在跑就没有排程）'
+  if (p.news === null) {
+    lines.push(miss('news', '新闻雷达'))
+  } else {
+    const items = p.news.latest ?? []
+    // ★ 取**最后一条**而不是第一条：`latestDigest()` 返回的是「最近 limit 条、
+    //   按时间正序」，所以最新的一条在末尾。取 `[0]` 会把最旧的一条当"最新"，
+    //   而那个错误看起来完全正常（有标题、有链接，只是过时了）。
+    const newest = items[items.length - 1]
+    const title = typeof newest?.title === 'string' ? newest.title.trim() : ''
+    const head = title.length > 0 ? ' · 最新「' + (title.length > 44 ? title.slice(0, 44) + '…' : title) + '」' : ''
+    lines.push('· 新闻雷达  最近 ' + items.length + ' 条够相关（门线 ' + (p.news.threshold ?? '?') + ' 分）' + head + newsNext)
+
+    // 内化提案的待办数。★ 这一段是"提案有人读"的证据：没有它，
+    //   提案躺在 data/learn/notes.jsonl 里没有任何人知道（判据 10）。
+    //   话术直接用**服务端那一句** —— 在本地另写一套判断，
+    //   迟早会出现"启动器说没有待办、面板说有 3 条"这种自相矛盾。
+    const speech = p.news.pendingSpeech
+    if (typeof speech === 'string' && speech.length > 0) {
+      lines.push('· 内化提案  ' + speech)
+    } else {
+      lines.push(miss('news.pending', '内化提案待办数'))
+    }
+
+    // 品种热度 → breadth 候选。这一行是雷达**唯一接回系统行为**的那根线，
+    // 所以它必须出现在启动画面上：坏了要第一时间看见。
+    const ticks = p.news.trending?.ticks
+    if (p.news.trending === null || p.news.trending === undefined) {
+      lines.push(miss('news.trending', '品种热度（breadth 的候选清单来源）'))
+    } else if (ticks && ticks.length === 0) {
+      lines.push('· 品种热度  空榜 —— 这一轮没有任何品种被提到（不是读不到）')
+    } else {
+      const top = (ticks ?? []).slice(0, 5).map((t) => t.ticker).join('、')
+      const sym = p.news.universe?.symbols ?? []
+      lines.push('· 品种热度  ' + top + ' → breadth 候选 ' + (sym.length > 0 ? sym.join('、') : '（空）'))
+    }
+  }
+
+  return lines
 }

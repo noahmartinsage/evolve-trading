@@ -245,11 +245,27 @@ export interface SloTargetView {
   unit: string
 }
 
+export interface AlertWebhookView {
+  at: number
+  /** 四档互不顶替：没配 / 已送出 / 被白名单拦下 / 没发出去。 */
+  outcome: 'not-configured' | 'sent' | 'blocked' | 'failed'
+  host: string
+  /** 服务端给的那句完整说明。界面直接展示，不重写。 */
+  note: string
+}
+
 export interface SloView {
   targets: SloTargetView[]
   ts: number
   breaches: { key: string; label: string; value: number; limit: number; unit: string }[]
   values: Record<string, number>
+  /**
+   * 最近一次告警外发的结果。
+   *
+   * ★ `null` = **从没触发过告警**（不是"通道正常"）；字段缺失 = 这个端点还没升级。
+   *   两者都不许显示成"正常"（判据 C7：缺数据要说出来）。
+   */
+  alertWebhook?: AlertWebhookView | null
 }
 
 export function getSlo(base: string, token: string): Promise<SloView> {
@@ -1054,8 +1070,264 @@ export interface TrustOverviewView {
   approvals: ApprovalView['summary']
 }
 
+// ── 下单预检：把「这笔交易凭什么可以出去」在下单**之前**问清楚 ──────────────
+//
+// ★ 四态**不在前端合并**。前端只负责原样显示：把 `blocked` 与 `unverifiable`
+//   合成一个"失败"会让操作者去改一个本来没问题的止盈价
+//   （真正该做的是去查行情连接）。判据 25：拒绝三态互不顶替。
+export type PrecheckVerdictView = 'pass' | 'blocked' | 'approval_required' | 'unverifiable'
+
+export interface PrecheckLegView {
+  id: string
+  name: string
+  passed: boolean
+  detail: string
+  code?: string
+}
+
+export interface PrecheckResultView {
+  verdict: PrecheckVerdictView
+  /** 只有 `pass` 是 true。**它是给按钮用的，不是给归因用的** —— 归因看 `verdict`。 */
+  submitAllowed: boolean
+  summary: string
+  symbol: string
+  side: 'buy' | 'sell'
+  notionalUsdt: number
+  legs: PrecheckLegView[]
+  blockers: PrecheckLegView[]
+  /** 管线扫到哪就停了 —— `checked` 可能小于 `total`，界面必须显示出来。 */
+  pipeline: { checked: number; total: number; blockedBy: string | null; reachedGeometry: boolean }
+  approval: { required: boolean; reason: string }
+  /** 未评估时为 null（不是零值对象）。 */
+  cost:
+    | {
+        ok: boolean
+        verdict: string
+        edgeMultiple: number
+        requiredMultiple: number
+        costShareBps: number
+        maxCostShareBps: number
+        totalCostUsdt: number
+        reason: string
+        requiredNotionalUsdt: number | null
+        maxViableNotionalUsdt: number | null
+      }
+    | null
+  geometry: { valid: boolean; rr: number; reason?: string; risk?: number; reward?: number } | null
+  exposure: {
+    grossBeforeUsdt: number
+    thisOrderUsdt: number
+    grossAfterUsdt: number
+    limitUsdt: number | null
+    unreleasedCount: number
+    overLimit: boolean
+  }
+  market: {
+    price: number
+    atr: number
+    adx1h?: number
+    macroTrend: string
+    macroTrendSource: string
+    dataQuality: string
+    snapshotAt: number | null
+    stale: boolean | null
+  }
+  confidenceUsed: number
+  /**
+   * 引擎口径的止盈/止损建议（由服务端 `computeStopGeometry` + `deriveStructureTarget` 产出）。
+   *
+   * ★ 大厅的默认值必须读它，**不许**自己写 `price * 1.03` 这种式子 ——
+   *   那正是"同一个事实两份口径"：面板显示 3%、引擎按 ATR 算出 1.9%，
+   *   两边都在正常工作，于是没人会发现不一致。
+   * 快照缺失或价不可用时为 `null`。
+   */
+  suggested: {
+    stopLoss: number
+    takeProfit: number
+    stopDistance: number
+    stopPct: number
+    atrMultiplier: number
+    stopBasis: string
+    targetBasis: string
+  } | null
+  assumptions: string[]
+  disclosures: string[]
+  /**
+   * 走势预测在这一笔里的角色。
+   *
+   * ★ `claims` 与 `outcome` 是**两件事**，界面必须分开显示：
+   *   `claims:false` ⇒ 预测没参与这笔决策（**不是**"预测同意了"）；
+   *   `claims:true, outcome:null` ⇒ 声称了但没评（取数失败那一支）；
+   *   `claims:true, outcome:'no-edge'` ⇒ 预测参与了，并说"没有统计优势"。
+   *   把前两种画成同一个绿勾，用户会以为每笔单都有预测背书。
+   */
+  forecast: {
+    claims: boolean
+    outcome: 'actionable' | 'no-edge' | 'unverifiable' | null
+    gate: string | null
+    direction: 'up' | 'down' | null
+    target: number | null
+    proposal: {
+      ok: boolean
+      side: 'buy' | 'sell' | null
+      entry: number | null
+      target: number | null
+      lo: number | null
+      hi: number | null
+      reason: string
+    } | null
+  }
+}
+
+export interface PrecheckOrderInput {
+  symbol: string
+  side: 'buy' | 'sell'
+  notionalUsdt: number
+  entry: number
+  takeProfit: number
+  stopLoss: number
+  confidence?: number
+  channel?: 'cex' | 'dex'
+  venue?: string
+  markPrice?: number
+  refresh?: boolean
+  /**
+   * 这笔单是否**声称以走势预测为依据**。缺省 `false`。
+   *
+   * ★ 前端只能传这个布尔，**不能传预测结论** —— 结论由服务端现算。
+   *   理由：依据是一句凭据，而凭据不能由被审的那一方自己填。
+   */
+  forecastClaims?: boolean
+  forecastHorizonMinutes?: number
+}
+
+/**
+ * 下单预检。**只读** —— 不改状态、不占台账、不写审批单。
+ *
+ * ★ 走服务端而不是在浏览器里算：闸门只有一份实现（`interceptors.runPipeline`），
+ *   前端自己算一份就是判据 8 说的"同一业务动作两条路径"。
+ *   前端在这里的职责只有一个 —— **显示**。
+ */
+export function precheckOrder(base: string, input: PrecheckOrderInput): Promise<PrecheckResultView> {
+  return orchFetch(base, '', '/orders/precheck', { method: 'POST', body: JSON.stringify(input) })
+}
+
 export function getCostBrief(base: string): Promise<CostBriefView> {
   return orchFetch(base, '', '/trust/cost/brief')
+}
+
+/** 走势图上的一个点：第 `step` 步之后价位的 10/50/90 分位。 */
+export interface ForecastPathPointView {
+  step: number
+  p10: number
+  p50: number
+  p90: number
+}
+
+/**
+ * 走势预测的只读视图（`GET /forecast?symbol=&minutes=`）。
+ *
+ * ── 为什么大厅要自己问一次预测，而不是只用预检返回的那条预测腿 ──────────
+ * 屏幕上那张走势图是给人在**下单之前**看的：先看见"未来一小时大概会走到哪、
+ * 有多不确定"，人才有依据去决定要不要按这个方向下单。
+ * 预检那条腿回答的是**另一个问题** —— "这一单声称以预测为依据，这句话成立吗"，
+ * 它只在点了检查之后才有，而且它只给结论、不给分位带（画不出图）。
+ *
+ * ★ 但两者**必须读同一个 horizon 控件**：`TerminalPage` 把同一个 `fcMinutes`
+ *   同时喂给这张图与 `precheck`。若各用各的默认值，屏幕上就会同时出现两个
+ *   "未来多久"的数 —— 两个口径不同的数不能放在一起看（判据 31）。
+ *
+ * ── 这张图为什么是"带"而不是"一条线" ────────────────────────────────────
+ * 预测给出的是未来收益的**经验分布**。任何一条单点曲线都是在假装确定，
+ * 而带宽本身就是"确定性有多低"的读数。`path` 为空时**不许**画一条平的假线出来
+ * （判据 24：说不出来的事要显式说，别用默认值顶）。
+ */
+export interface ForecastView {
+  symbol: string
+  barMinutes: number
+  horizonBars: number
+  /** 预测所站的那根 bar 的时间戳（"as of"）。 */
+  asOf: number
+  spot: number
+  method: string
+  /**
+   * ★ 三态判决。`no-edge` 不是"算失败"，而是**算成功了、结论是没有优势** ——
+   *   界面必须把这两件事分开说，否则用户会把"没有优势"读成"系统坏了"。
+   */
+  outcome: 'actionable' | 'no-edge' | 'unverifiable'
+  gate: string
+  direction: 'up' | 'down' | null
+  target: number | null
+  medianBps: number | null
+  interval: { lo: number; hi: number; coverage: number } | null
+  path: ForecastPathPointView[]
+  netEdgeBps: number | null
+  oneWayCostBps: number
+  roundTripCostBps: number
+  state: { slug: string; nameCn: string; trainIc: number }[]
+  sample: { candidates: number; matched: number; separated: number; trainBars: number; testBars: number }
+  calibration: {
+    anchors: number
+    hits: number
+    hitRate: number
+    baseRate: number
+    baseRule: string
+    se: number
+    edgeZ: number
+    pValue: number
+    coverageNominal: number
+    coverageActual: number
+    flatAnchors: number
+  } | null
+  reasons: { from: string; text: string }[]
+  disclosures: string[]
+  dataHash: string
+  origin: string
+  elapsedMs: number
+  cache: { hit: boolean; computedAt: number }
+}
+
+export interface ForecastResponseView {
+  ok: true
+  headline: string
+  /**
+   * 服务端归一出来的分辨率。★ 调用方**不能**自报 `barMinutes` ——
+   * 端点只收 `minutes`，由服务端唯一的 `resolveHorizon()` 翻译。
+   * `rounded` 为真 = 你要的分钟数对不齐证据底座，被并到最近的一档
+   * （例：要 5 分钟，证据只有 15 分钟一根 ⇒ 按 15 分钟给，并**说出来**）。
+   */
+  horizon: {
+    barMinutes: number
+    horizonBars: number
+    askedMinutes: number
+    actualMinutes: number
+    rounded: boolean
+  }
+  result: ForecastView
+}
+
+/**
+ * 走势预测。**只读** —— 不落盘、不下单、不改任何状态。
+ *
+ * ★ 参数只有「标的」与「未来多少分钟」两个。分辨率**刻意不可传**：
+ *   传错了会去找不存在的历史文件，然后静默回落成合成价格，
+ *   而返回里每个字段都看着像真的（判据 13）。端点会明确拒绝这类参数。
+ *
+ * ★★ 为什么必须传 `token`（原先这里传的是 `''`，界面上是 401）：
+ *   `/forecast` 与它的同族 `/factors/index`、`/breadth/index` 一样，
+ *   是**服务端现算的分析指数**，路由层要 `authorized(req)`。
+ *   我先前只用 `curl -H "x-orch-token: …"` 验过端点，于是"验通了"，
+ *   而**真正读它的那条路（界面）一次都没通过** —— 判据 10 的镜像：
+ *   「有端点 ≠ 有人读」之外还要加一句「**我用我的凭据测通 ≠ 调用方能读**」。
+ *   验证必须走**调用方自己的那条路**，否则验的是另一件事。
+ */
+export function getForecast(
+  base: string,
+  token: string,
+  input: { symbol: string; minutes: number },
+): Promise<ForecastResponseView> {
+  const q = new URLSearchParams({ symbol: input.symbol, minutes: String(input.minutes) })
+  return orchFetch(base, token, `/forecast?${q.toString()}`)
 }
 
 export function assessCost(base: string, input: Record<string, unknown>): Promise<{ assessment: CostAssessmentView }> {
@@ -1383,4 +1655,668 @@ export async function startMission(
     return { ok: false, code: 'EMPTY_BODY', reason: '编排层回了空响应（HTTP ' + r.status + '）。', httpStatus: r.status }
   }
   return { ...r.body, httpStatus: r.status }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 因子生产线（台账 + 策略层筛查）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 因子台账的一行。字段全来自服务端，前端不做任何加工。 */
+export interface FactorIndexRowView {
+  slug: string
+  nameCn: string
+  category: string
+  base: string
+  transform: string
+  window: number
+  state: 'accepted' | 'rejected' | 'unverifiable'
+  gate: string
+  reason: string
+  /** 判决所依据的数据来源。非 `history` 时**永远不该出现 accepted**（fail-closed）。 */
+  origin: string
+  /** 判决时那份行情的指纹。与当前行情不同 ⇒ 这行结论已过时。 */
+  dataHash: string
+  bars: number
+  coverage: number
+  icMean5: number | null
+  icir: number | null
+  turnover: number | null
+  quantileSpreadBps: number | null
+  firstSeenAt: string
+  lastEvaluatedAt: string
+}
+
+/** 台账概况。`inconsistent` 是判定器升级后遗留的**陈旧判决**条数。 */
+export interface FactorIndexSummaryView {
+  available: boolean
+  total: number
+  accepted: number
+  rejected: number
+  unverifiable: number
+  inconsistent: number
+  inconsistentReason: string | null
+  historyShare: number
+  updatedAt: string | null
+  reason: string
+}
+
+export interface FactorIndexResponse {
+  ok: boolean
+  damaged: string | null
+  summary: FactorIndexSummaryView
+  /** **当前**行情的指纹。与某一行的 `dataHash` 不同 ⇒ 那一行的判决已过时。 */
+  currentDataHash: string
+  /** 判决与自身指标自相矛盾的行（判定器升级后遗留的陈旧判决）。 */
+  inconsistentSlugs: string[]
+  index: { thresholds: Record<string, number>; horizons: number[]; rows: FactorIndexRowView[]; updatedAt: string }
+}
+
+/**
+ * 策略层台账的一行：因子**扣掉成本与滑点之后**还赚不赚钱。
+ *
+ * ★ `worstFoldGrossReturnPct` 与 `worstFoldReturnPct` 必须成对读：
+ *   毛正净负 ⇒ 信号有方向、被成本吃掉（该降换手）；毛本身就负 ⇒ 方向不成立。
+ *   只有一个数字时，这两种局面长得一模一样。
+ */
+export interface FactorStrategyRowView {
+  slug: string
+  sign: 1 | -1 | null
+  state: 'accepted' | 'rejected' | 'unverifiable'
+  gate: string
+  reason: string
+  trainIc: number | null
+  origin: string
+  factorDataHash: string
+  screenDataHash: string
+  /** false ⇒ 这一行的判决是**另一份行情**上做的，已经过时。 */
+  dataHashMatch: boolean
+  folds: number
+  worstFoldReturnPct: number | null
+  worstFoldGrossReturnPct: number | null
+  costDragPct: number | null
+  /**
+   * 各折毛收益的**均值**。必须与 `worstFoldGrossReturnPct` 并列读 ——
+   * 单折毛收益的 σ≈13% 而均值只有几个百分点，所以"最差折"天然为负，
+   * 拿它当判据会把真有边际的策略全判成"方向不成立"（15 轮实测 1/14 vs 11/14）。
+   */
+  meanFoldGrossReturnPct: number | null
+  /** 每笔成交的毛边际 / 成本，单位 bps。**归因唯一判据**：前者 ≤ 0 ⇒ 方向不成立。 */
+  meanGrossBpsPerFill: number | null
+  meanCostBpsPerFill: number | null
+  /** 每折成交笔数均值 —— 上面两个 bps 的**分母来源**。 */
+  meanFillsPerFold: number | null
+  /** 比例（0..1），**不是**百分数。 */
+  winRate: number | null
+  closedTrades: number
+  signAgreement: number | null
+  reverseChecked: boolean
+  bothDirectionsPass: boolean
+  lastEvaluatedAt: string
+}
+
+export interface FactorStrategySummaryView {
+  available: boolean
+  total: number
+  accepted: number
+  rejected: number
+  unverifiable: number
+  /** 其中有几个**当下可用**（指纹与当前行情一致）。 */
+  usableNow: number
+  stale: number
+  updatedAt: string | null
+  reason: string
+}
+
+export interface FactorStrategyResponse {
+  ok: boolean
+  damaged: string | null
+  summary: FactorStrategySummaryView
+  index: { thresholds: Record<string, number>; config: Record<string, unknown>; rows: FactorStrategyRowView[]; updatedAt: string }
+}
+
+export function getFactorIndex(base: string, token: string): Promise<FactorIndexResponse> {
+  return orchFetch(base, token, '/factors/index')
+}
+
+export function getFactorStrategies(base: string, token: string): Promise<FactorStrategyResponse> {
+  return orchFetch(base, token, '/factors/strategies')
+}
+
+// ─────────────────────────── 横截面（breadth） ───────────────────────────
+//
+// 因子线的**第三层**。类型与 `server/breadthService.ts` 的 `BreadthRow`
+// 逐字段对应，不在这里另起名字：两套名字（`state` vs `outcome`）是这一类
+// 接口层最常见的分叉来源 —— 服务端加了字段、前端读旧名，表现是
+// **界面上某一格永远空着，而且不报任何错**（判据 11 的一种）。
+
+export interface BreadthRowView {
+  slug: string
+  nameCn: string
+  category: string
+  base: string
+  transform: string
+  window: number
+  horizon: number
+  outcome: 'accepted' | 'rejected' | 'unverifiable'
+  gate: string
+  reason: string
+  headline: string
+  panelHash: string
+  symbols: number
+  panelBars: number
+  topK: number
+  /** 方向来自**训练段** IC 的符号。`null` = 训练段定不了方向。 */
+  sign: 1 | -1 | null
+  trainSections: number
+  trainMeanIc: number | null
+  trainTStat: number | null
+  sections: number
+  icSkipped: number
+  meanIc: number | null
+  tStat: number | null
+  positiveShare: number | null
+  bothDirectionsPass: boolean
+  rebalances: number
+  skipped: number
+  /** 每腿毛边际（bps）。null = 没跑出轮次（**不是 0**）。 */
+  grossBpsPerLeg: number | null
+  costBpsPerLeg: number
+  netBpsPerLeg: number | null
+  longBpsPerLeg: number | null
+  shortBpsPerLeg: number | null
+  marketBpsPerLeg: number | null
+  winRate: number | null
+  turnoverPerRebalance: number | null
+  lastEvaluatedAt: string
+}
+
+export interface BreadthPanelFactView {
+  origin: string
+  symbols: string[]
+  bars: number
+  from: number
+  to: number
+  dropped: number
+  missing: string[]
+  sources: {
+    symbol: string
+    bars: number
+    kept: number
+    from: number
+    to: number
+    contentHash: string
+    file: string
+  }[]
+}
+
+export interface BreadthSummaryView {
+  available: boolean
+  reason: string
+  rows: number
+  accepted: number
+  rejected: number
+  unverifiable: number
+  byGate: Record<string, number>
+  panelSymbols: number
+  panelBars: number
+  updatedAt: string
+}
+
+export interface BreadthResponse {
+  ok: boolean
+  damaged: string | null
+  summary: BreadthSummaryView
+  index: {
+    thresholds: Record<string, number>
+    /** ★ 只是**最近一次**运行用的配置 —— 台账可同时含多套（同一面板 × 多个持有期）。
+     *  逐行配置看 `rows[].horizon` / `rows[].topK`。名字与 `breadthService` 逐字一致。 */
+    lastRunConfig: Record<string, unknown>
+    panel: BreadthPanelFactView | null
+    rows: BreadthRowView[]
+    updatedAt: string
+  }
+}
+
+export function getBreadthIndex(base: string, token: string): Promise<BreadthResponse> {
+  return orchFetch(base, token, '/breadth/index')
+}
+
+// ─────────────────────────── Agent 舰队 ───────────────────────────
+//
+// ★ 这些类型刻意与 `server/fleet/service.ts` 的视图**逐字段对应**，而不是
+//   在这里另起一套名字。两套名字（`state` vs `status`、`lastRun` vs `last`）
+//   是这类"接口层"最常见的分叉来源：服务端加了字段、前端读的是旧名，
+//   表现是**界面上一格永远空着**，而且不报任何错。
+
+export interface FleetConsumerView {
+  id: string
+  label: string
+  kind: string
+}
+
+export interface FleetAgentView {
+  id: string
+  label: string
+  duty: string
+  kind: 'read' | 'act'
+  cost: string
+  reuses: string
+  output: string
+  consumers: FleetConsumerView[]
+  emits: string[]
+  consumes: string[]
+  /** `never` 不是"健康"，是"还没跑过" —— 面板必须把它画得与「正常」不同。 */
+  state: 'never' | 'ok' | 'failed'
+  runCount: number
+  okCount: number
+  failCount: number
+  lastRun: { at: number; ok: boolean; summary: string; durationMs: number; dryRun: boolean } | null
+  inbox: { topic: string; msgId: string; from: string; note: string; ts: number }[]
+}
+
+export interface FleetProblem {
+  /** 机器可判的代号 —— 与 `server/fleet/registry.ts` 的字段名逐字对齐。 */
+  code: string
+  agentId: string
+  problem: string
+}
+
+export interface FleetTaskStepView {
+  agentId: string
+  label: string
+  ok: boolean
+  summary: string
+  reason?: string
+  durationMs: number
+  inputFrom: string[]
+  independent: boolean
+  emitted: { topic: string; msgId: string; deliveredTo: string[] }[]
+  dryRun: boolean
+}
+
+export interface FleetTaskReceiptView {
+  taskId: string
+  goal: string
+  why: string
+  steps: FleetTaskStepView[]
+  ok: boolean
+  failedAt: string | null
+  refusal: string | null
+  durationMs: number
+  ledgerEvents: number
+  messageCount: number
+}
+
+export interface FleetSnapshotResponse {
+  snapshot: {
+    generatedAt: number
+    registry: { agents: number; problems: FleetProblem[] }
+    bus: { topics: number; subscriptions: number; messages: number; subscribers: Record<string, string[]> }
+    agents: FleetAgentView[]
+    recentMessages: { id: string; topic: string; from: string; ts: number; taskId: string | null }[]
+    lastTask: FleetTaskReceiptView | null
+    provenance: string
+  }
+  roster: { id: string; label: string; kind: string; cost: string; duty: string }[]
+  topics: { id: string; label: string; kind: string; meaning: string }[]
+  consumers: { id: string; label: string; kind: string }[]
+  plans: { id: string; label: string; chain: string[]; why: string }[]
+}
+
+export interface FleetRunReceiptView {
+  agentId: string
+  label: string
+  ok: boolean
+  summary: string
+  steps: string[]
+  reason?: string
+  durationMs: number
+  dryRun: boolean
+  emitted: { topic: string; msgId: string; deliveredTo: string[] }[]
+  inputFrom: string[]
+}
+
+export function getFleet(base: string, token: string): Promise<FleetSnapshotResponse> {
+  return orchFetch(base, token, '/fleet')
+}
+
+export function runFleetAgent(
+  base: string,
+  token: string,
+  input: { agentId: string; arg?: string; confirmed?: boolean; dryRun?: boolean },
+): Promise<FleetRunReceiptView> {
+  return orchFetch(base, token, '/fleet/run', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function runFleetTask(
+  base: string,
+  token: string,
+  input: { goal: string; confirmed?: boolean; dryRun?: boolean },
+): Promise<FleetTaskReceiptView & { brief: string }> {
+  return orchFetch(base, token, '/fleet/task', { method: 'POST', body: JSON.stringify(input) })
+}
+
+/**
+ * 只问"这句话能不能接"，**不执行**。
+ *
+ * 界面与语音都要在跑之前先问一次 —— 否则用户看到的是系统先动起来、
+ * 半秒后才被告知"这个我听不懂"。
+ */
+export function planFleetTask(
+  base: string,
+  token: string,
+  goal: string,
+): Promise<{ ok: boolean; plan: { id: string; label: string; chain: string[] } | null; why: string }> {
+  return orchFetch(base, token, '/fleet/plan', { method: 'POST', body: JSON.stringify({ goal }) })
+}
+
+export interface FleetLiveState {
+  data: FleetSnapshotResponse | null
+  error: string | null
+  refresh: () => void
+}
+
+/**
+ * 舰队实况轮询。
+ *
+ * 失败**不清空已有数据**：舰队页最怕的是"网络抖一下，整页变成一片空"，
+ * 用户会以为成员都没了。错误单独放 `error`，界面照旧显示上一份快照并标出
+ * "这份数据是 N 秒前的"。
+ */
+export function useFleet(base: string, token: string, pollMs = 5000): FleetLiveState {
+  const [data, setData] = useState<FleetSnapshotResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    let alive = true
+    let busy = false
+    const poll = async () => {
+      if (busy) return
+      busy = true
+      try {
+        const res = await getFleet(base, token)
+        if (!alive) return
+        setData(res)
+        setError(null)
+      } catch (e) {
+        if (!alive) return
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        busy = false
+      }
+    }
+    void poll()
+    const t = setInterval(poll, pollMs)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [base, token, pollMs, tick])
+
+  return { data, error, refresh: () => setTick((n) => n + 1) }
+}
+
+// ═══════════════════ 新闻雷达（第十八轮 · 推送面）═══════════════════
+//
+// 内化来源（GitHub 上几个专业加密新闻雷达的共性做法）：
+//   · sentix / chainpulse 的「News Feed + Market Overview」—— 顶部指标 + 可筛条目
+//   · nlp3 的「Source Intelligence」—— **按源**统计战绩，用来判断哪个源该留
+//   · crypto-sentiment-monitor 的「Real-Time News Ticker / Topic Radar」—— 滚动情报条 + 热度榜
+//   · swarm-trading-console.html 的「集群情报流 + KPI 卡带色条 + 人类决策队列」
+// 本项目**不抄**它们的 NLP 情感打分：本系统的相关性判据必须是确定性规则
+// （`RELEVANCE_TERMS`），否则"为什么觉得这条相关"就答不上来。
+
+export interface NewsItemView {
+  id: string
+  title: string
+  url: string
+  source: string
+  summary: string
+  publishedAt: number | null
+  score: number
+  matched: string[]
+  reasons: string[]
+}
+
+export interface NewsSourceStatView {
+  id: string
+  label: string
+  /**
+   * `null` = 最近一轮的报告里没有这个源的记录（还没跑过 / 新加的源）。
+   *
+   * ★ 它**不是** `false`。`false` 是"这一轮没通"（要去查源或换词），
+   *   `null` 是"我不知道"（等下一轮）。两种都画成红色会让用户在
+   *   系统从没跑过的时候去改一个本来好好的源。
+   */
+  ok: boolean | null
+  /** 这一轮抓了几条。`null` 同 `ok` 的理由 —— 它不是 0。 */
+  got: number | null
+  /** 从当天速览里数出来的过门条数（累计，不是这一轮）。 */
+  kept: number
+  scoreSum: number
+  avgScore: number
+}
+
+export interface NewsTickerHitView {
+  ticker: string
+  mentions: number
+  weighted: number
+  samples: string[]
+}
+
+export interface NewsProposalRowView {
+  noteId: string
+  index: number
+  at: number
+  source: 'model' | 'rules'
+  title: string
+  evidence: string
+  action: string
+  risk: 'low' | 'middle' | 'high'
+  observations: string[]
+  decision: 'approve' | 'reject' | null
+  decidedAt: number | null
+  decidedBy: string | null
+  decisionWhy: string | null
+}
+
+export interface NewsPanelResponse {
+  latest: NewsItemView[]
+  threshold: number
+  sources: { id: string; label: string; kind: string; why: string }[]
+  sourceStats: NewsSourceStatView[]
+  terms: { term: string; weight: number; why: string }[]
+  /** `null` 表示读不到榜单 —— 与 `ticks: []`（空榜）是两件事，界面上必须分开画。 */
+  trending: { at: number; ticks: NewsTickerHitView[] } | null
+  universe: { symbols: string[]; note: string }
+  proposals: NewsProposalRowView[]
+  pending: number
+  pendingSpeech: string
+  /**
+   * 最近一轮的报告。`null` = 这个工作目录还从来没跑过一轮。
+   *
+   * ★ 它是各源战绩与"最近一轮速览"时刻的**唯一**来源（服务端那边读的是
+   *   `data/news/last-run.json`）。所以界面**不许**在 `null` 时自己编一个 0 ——
+   *   "还没跑过"与"跑了但什么都没抓到"是两件事（判据 24）。
+   */
+  lastRun: { at: number; fetched: number; kept: number; fresh: number; speech: string } | null
+  /**
+   * 服务端自己那句「跑一轮」的说法（= 自治循环里 `news_watch` 那一项的 `goal`）。
+   *
+   * ★ 界面**不许**自己拼这句话。拼了之后，按钮跑的东西与定时跑的东西
+   *   就不再是同一件事了 —— 而它们长得一模一样，谁也不会发现（判据 8）。
+   */
+  runGoal: string
+  recentEvents: { at: number; kind: string; payload: Record<string, unknown> }[]
+}
+
+export function getNews(base: string, token: string, limit = 20): Promise<NewsPanelResponse> {
+  return orchFetch<NewsPanelResponse>(base, token, `/fleet/news?limit=${limit}`)
+}
+
+// ─────────────────── UI 动作通道（桌宠驱动界面）───────────────────
+//
+// ★ 这一组与其它端点有一处**结构上的不同**：它的消费者是**界面自己**。
+//   界面每 2 秒来取一次"有没有人要你按什么"，按完把结果报回去。
+//   于是"桌宠说按一下"与"人手点一下"最终落到同一个 DOM 元素上 ——
+//   这就是它存在的全部意义：不给桌宠开一条绕过界面的旁路。
+
+export interface UiActionSpecView {
+  id: string
+  page: string
+  label: string
+  writes: boolean
+  speaks: string
+  /**
+   * 这颗按钮接受哪些参数。**只读的说明**，不是校验依据 ——
+   * 校验在服务端（那里有行情注册表与预测层），界面这份只是用来
+   * 在面板上显示"这一下带的是哪几个参数"。
+   */
+  payloadKeys?: readonly string[]
+}
+
+export interface UiTaskView {
+  id: string
+  actionId: string
+  page: string
+  at: number
+  requestedBy: string
+  status: 'pending' | 'done' | 'failed'
+  stale: boolean
+  detail?: string
+  /**
+   * 按这一下时**用什么参数**（如 `{ symbol: 'BTCUSDT', minutes: 60 }`）。
+   *
+   * ★ 执行器拿它去驱动页面 —— 没有它，桌宠念的是 BTC / 60 分钟，
+   *   而界面按下后画的是**屏幕当前选着的**那个标的与尺度。
+   *   两个数各自都对，放在一起看没有意义（判据 31）。
+   * ★ 键的合法性在服务端就已经校验过（白名单 + 归一），这里拿到的是**归一后**的那一份。
+   */
+  payload?: Record<string, unknown>
+  spec: UiActionSpecView
+}
+
+export interface UiActionsView {
+  pages: { id: string; label: string }[]
+  actions: UiActionSpecView[]
+  tasks: UiTaskView[]
+  queueSpeech: string
+}
+
+export function getUiActions(base: string, token: string): Promise<UiActionsView> {
+  return orchFetch<UiActionsView>(base, token, '/ui/actions')
+}
+
+export interface UiPendingView {
+  tasks: UiTaskView[]
+  /** 服务端读队列失败时的原因。**有它就说明这次是"读不到"，不是"没有"。** */
+  error?: string
+}
+
+/**
+ * 取待执行动作。
+ *
+ * ★ `client` 是**这个窗口**的标识，服务端会把它写进认领记录。
+ *   不传的话服务端只能记一个笼统的 `'ui'` —— 于是"两个窗口都在跑"时，
+ *   事后查账只能看到"有界面按了它"，**分不出是哪一窗按的**。
+ *   多窗口是本系统明确支持的用法（取活即认领就是为了它），
+ *   所以认领记录必须能指名到窗 —— 否则出问题时归因不了。
+ */
+export function getPendingUiActions(base: string, token: string, client: string): Promise<UiPendingView> {
+  return orchFetch<UiPendingView>(base, token, `/ui/actions/pending?by=${encodeURIComponent(client)}`)
+}
+
+export function postUiActionResult(
+  base: string,
+  token: string,
+  id: string,
+  body: { ok: boolean; detail: string; client: string },
+): Promise<{ ok: boolean; reason?: string }> {
+  return orchFetch<{ ok: boolean; reason?: string }>(base, token, `/ui/actions/${id}/result`, {
+    method: 'POST',
+    body: JSON.stringify({ ok: body.ok, detail: body.detail, by: body.client }),
+  })
+}
+
+/**
+ * 排一条界面动作。
+ *
+ * ★ `confirmed` 与新闻裁决那条是同一个约定：`writes: true` 的动作
+ *   服务端在没有它时回 422，且这个 true 只能来自人的第二次点击。
+ */
+export function postUiAction(
+  base: string,
+  token: string,
+  body: { actionId: string; confirmed?: boolean; payload?: Record<string, unknown> },
+): Promise<{ ok: boolean; reason?: string; speech?: string; task?: UiTaskView }> {
+  return orchFetch(base, token, '/ui/actions', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export interface NewsVerdictResult {
+  ok: boolean
+  writtenTo?: string
+  decision?: string
+  pending?: number
+  speech?: string
+  error?: string
+  note?: string
+}
+
+/**
+ * 人对提案拍板。
+ *
+ * ★ `confirmed` 由调用方显式给 true —— 服务端在没有它时回 422。
+ *   界面负责让这个 true 一定来自**第二次**点击（两段式），
+ *   而不是把这个字段当成一个可以顺手写上的常量。
+ */
+export function postNewsVerdict(
+  base: string,
+  token: string,
+  body: { noteId: string; index: number; decision: 'approve' | 'reject'; why?: string; confirmed: boolean },
+): Promise<NewsVerdictResult> {
+  return orchFetch<NewsVerdictResult>(base, token, '/fleet/news/verdict', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export interface NewsLiveState {
+  data: NewsPanelResponse | null
+  error: string | null
+  refresh: () => void
+}
+
+export function useNews(base: string, token: string, pollMs = 20_000): NewsLiveState {
+  const [data, setData] = useState<NewsPanelResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    let alive = true
+    let busy = false
+    const poll = async () => {
+      if (busy) return
+      busy = true
+      try {
+        const res = await getNews(base, token)
+        if (!alive) return
+        setData(res)
+        setError(null)
+      } catch (e) {
+        if (!alive) return
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        busy = false
+      }
+    }
+    void poll()
+    const t = setInterval(poll, pollMs)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [base, token, pollMs, tick])
+
+  return { data, error, refresh: () => setTick((n) => n + 1) }
 }
